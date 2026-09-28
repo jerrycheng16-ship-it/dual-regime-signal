@@ -7,9 +7,13 @@ from scipy.spatial.distance import cdist
 # 1. Statistical Jump Model (SJM) 實作
 # ==========================================
 class StatisticalJumpModel:
+    """
+    Step 1: Discrete-state Statistical Jump Model (SJM)
+    透過帶有 Jump Penalty (\lambda) 的動態規劃求解隱含市場狀態
+    """
     def __init__(self, n_clusters=2, jump_penalty=10.0):
         self.n_clusters = n_clusters
-        self.jump_penalty = jump_penalty
+        self.jump_penalty = float(jump_penalty)
         self.centroids = None
 
     def fit_predict(self, X):
@@ -58,6 +62,9 @@ class StatisticalJumpModel:
 # 2. 特徵工程 (Feature Engineering)
 # ==========================================
 def extract_minimalist_features(returns_df):
+    """
+    Step 1: Minimalist 特徵工程 (均值、下行標準差、Sortino Ratio)
+    """
     features = {}
     for col in returns_df.columns:
         r = returns_df[col]
@@ -80,19 +87,17 @@ def extract_minimalist_features(returns_df):
 # ==========================================
 class DualRegimeAllocationModel:
     def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63):
-        self.jp_global = jump_penalty_global
-        self.jp_asset = jump_penalty_asset
-        self.threshold = prob_threshold
-        self.ewm_window = ewm_window
+        self.jp_global = float(jump_penalty_global)
+        self.jp_asset = float(jump_penalty_asset)
+        self.threshold = float(prob_threshold)
+        self.ewm_window = int(ewm_window)
         
     def run_pipeline(self, returns_df, macro_df, global_proxy_col='LargeCap', riskfree_col='RiskFree'):
-        # 1. 建立 Minimalist 特徵
+        # 建立特徵矩陣
         X_min = extract_minimalist_features(returns_df)
-        
-        # 2. 建立 Comprehensive 特徵 (修正新版 pandas ffill 寫法)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
-        # 確保型態純粹為浮點數，避免 XGBoost / SciPy 轉型拋出 TypeError
+        # 強制轉型為 float64 NumPy 陣列以防止 XGBoost / SciPy 發生 TypeError
         X_min_vals = X_min.astype(np.float64)
         X_comp_vals = X_comp.astype(np.float64)
         
@@ -100,7 +105,7 @@ class DualRegimeAllocationModel:
         dates = X_min.index
         
         # ----------------------------------------------------
-        # Step 1: 全域與單一資產 SJM 標籤識別
+        # Step 1: SJM 全域與單一資產狀態識別
         # ----------------------------------------------------
         global_min_feat = [c for c in X_min.columns if global_proxy_col in c]
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
@@ -125,11 +130,10 @@ class DualRegimeAllocationModel:
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
         # ----------------------------------------------------
-        # Step 2: XGBoost 預測與平滑處理
+        # Step 2: XGBoost 狀態預測與 EWM 平滑化
         # ----------------------------------------------------
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1)
         
-        # 轉成 numpy array 傳給 XGBoost 防止 Pandas 索引欄位引發 TypeError
         X_train_g = X_comp_vals.iloc[:-1].values
         y_train_g = y_global.iloc[:-1].values.astype(int)
         
@@ -137,10 +141,10 @@ class DualRegimeAllocationModel:
         xgb_global.fit(X_train_g, y_train_g)
         prob_global_bull = xgb_global.predict_proba(X_comp_vals.values)[:, 1]
         
-        pred_global_bear = (prob_global_bull < (1 - self.threshold)).astype(int)
+        pred_global_bear = (prob_global_bull < (1.0 - self.threshold)).astype(int)
         pred_global_bull = (prob_global_bull > self.threshold).astype(int)
         
-        alpha_ewm = 2.0 / (self.ewm_window + 1)
+        alpha_ewm = 2.0 / (self.ewm_window + 1.0)
         smoothed_prob_asset_bull = {}
         
         for a in risky_assets:
@@ -158,7 +162,7 @@ class DualRegimeAllocationModel:
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
         # ----------------------------------------------------
-        # 建立 BMDA 與 BMGA 動態資產池
+        # 建立 BMDA 與 BMGA 資產池
         # ----------------------------------------------------
         bmda_sets = {}
         bmga_sets = {}
@@ -186,10 +190,10 @@ class DualRegimeAllocationModel:
                 bmga_sets[d] = [global_proxy_col]
 
         # ----------------------------------------------------
-        # Step 3: 投資組合配置與回測
+        # Step 3: 等權重資產配置與回測
         # ----------------------------------------------------
         portfolio_returns = []
-        tc_rate = 0.0010
+        tc_rate = 0.0010 # 10 bps 交易成本
         prev_weights = pd.Series(0.0, index=returns_df.columns)
         
         for t in range(len(dates) - 1):
