@@ -98,6 +98,20 @@ class DualRegimeAllocationModel:
         else:
             return XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
 
+    def _safe_fit_predict_proba(self, X_train, y_train, X_all):
+        """
+        防禦型擬合：若 y_train 只有單一類別 (例如全 0 或全 1)，避免 ValueError
+        """
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) < 2:
+            # 若只有單一類別，直接回傳該類別的機率 1.0 或 0.0
+            single_val = float(unique_classes[0])
+            return np.full(len(X_all), single_val)
+        
+        clf = self._create_classifier()
+        clf.fit(X_train, y_train)
+        return clf.predict_proba(X_all)[:, 1]
+
     def run_pipeline(self, returns_df, macro_df, global_proxy_col='LargeCap', riskfree_col='RiskFree'):
         X_min = extract_minimalist_features(returns_df)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
@@ -108,7 +122,9 @@ class DualRegimeAllocationModel:
         risky_assets = [c for c in returns_df.columns if c not in [global_proxy_col, riskfree_col]]
         dates = X_min.index
         
+        # ----------------------------------------------------
         # Step 1: SJM 狀態識別
+        # ----------------------------------------------------
         global_min_feat = [c for c in X_min.columns if global_proxy_col in c]
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_min_vals[global_min_feat].values)
@@ -131,15 +147,16 @@ class DualRegimeAllocationModel:
             
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
-        # Step 2: 分類器狀態預測
+        # ----------------------------------------------------
+        # Step 2: 分類器狀態預測 (加入單一類別防護)
+        # ----------------------------------------------------
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1)
         
         X_train_g = X_comp_vals.iloc[:-1].values
         y_train_g = y_global.iloc[:-1].values.astype(int)
         
-        xgb_global = self._create_classifier()
-        xgb_global.fit(X_train_g, y_train_g)
-        prob_global_bull = xgb_global.predict_proba(X_comp_vals.values)[:, 1]
+        # 安全預測機率
+        prob_global_bull = self._safe_fit_predict_proba(X_train_g, y_train_g, X_comp_vals.values)
         
         pred_global_bear = (prob_global_bull < (1.0 - self.threshold)).astype(int)
         pred_global_bull = (prob_global_bull > self.threshold).astype(int)
@@ -152,16 +169,16 @@ class DualRegimeAllocationModel:
             X_train_a = X_comp_vals.iloc[:-1].values
             y_train_a = y_asset.iloc[:-1].values.astype(int)
             
-            xgb_asset = self._create_classifier()
-            xgb_asset.fit(X_train_a, y_train_a)
-            raw_prob_bull = xgb_asset.predict_proba(X_comp_vals.values)[:, 1]
+            raw_prob_bull = self._safe_fit_predict_proba(X_train_a, y_train_a, X_comp_vals.values)
             
             prob_series = pd.Series(raw_prob_bull, index=dates)
             smoothed_prob_asset_bull[a] = prob_series.ewm(alpha=alpha_ewm).mean()
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
+        # ----------------------------------------------------
         # 建立 BMDA / BMGA 資產池
+        # ----------------------------------------------------
         bmda_sets = {}
         bmga_sets = {}
         
@@ -187,7 +204,9 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
+        # ----------------------------------------------------
         # Step 3: 回測計算
+        # ----------------------------------------------------
         portfolio_returns = []
         tc_rate = 0.0010
         prev_weights = pd.Series(0.0, index=returns_df.columns)
