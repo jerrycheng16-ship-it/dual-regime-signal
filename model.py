@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 
-# 防禦性導入：若 xgboost 發生 ImportError，自動備援使用 RandomForest
+# 防禦性導入：若 xgboost 發生 ImportError，自動備援使用 scikit-learn 的 RandomForest
 try:
     from xgboost import XGBClassifier
     USE_XGB = True
@@ -152,7 +152,7 @@ class DualRegimeAllocationModel:
             X_train_a = X_comp_vals.iloc[:-1].values
             y_train_a = y_asset.iloc[:-1].values.astype(int)
             
-            xgb_asset = self._createClassifier() if hasattr(self, '_createClassifier') else self._create_classifier()
+            xgb_asset = self._create_classifier()
             xgb_asset.fit(X_train_a, y_train_a)
             raw_prob_bull = xgb_asset.predict_proba(X_comp_vals.values)[:, 1]
             
