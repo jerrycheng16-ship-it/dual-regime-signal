@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 
-# 從 model.py 載入先前寫好的資產配置模型類別
+# 從 model.py 載入模型
 from model import DualRegimeAllocationModel
 
 st.set_page_config(page_title="雙重狀態資產配置模型", layout="wide")
@@ -30,7 +29,7 @@ run_button = st.sidebar.button("🚀 執行模型回測")
 # ==========================================
 @st.cache_data
 def generate_mock_data():
-    """生成模擬市場數據 (亦可改為載入真實 CSV/YFinance 資料)"""
+    """生成模擬市場數據"""
     np.random.seed(2026)
     dates = pd.date_range('2020-01-01', '2025-12-31', freq='B')
     asset_names = ['LargeCap', 'MidCap', 'SmallCap', 'EAFE', 'Treasury', 
@@ -47,15 +46,21 @@ def generate_mock_data():
 
 returns_df, macro_df = generate_mock_data()
 
+# 安全地執行 pipeline 避開型態衝突
 if run_button or 'results' not in st.session_state:
     with st.spinner("模型運算中 (SJM 識別 + XGBoost 預測)..."):
-        model = DualRegimeAllocationModel(
-            jump_penalty_global=jp_global,
-            jump_penalty_asset=jp_asset,
-            prob_threshold=prob_thresh,
-            ewm_window=ewm_win
+        model_instance = DualRegimeAllocationModel(
+            jump_penalty_global=float(jp_global),
+            jump_penalty_asset=float(jp_asset),
+            prob_threshold=float(prob_thresh),
+            ewm_window=int(ewm_win)
         )
-        res_df, bmda_hist, bmga_hist = model.run_pipeline(returns_df, macro_df)
+        
+        res_df, bmda_hist, bmga_hist = model_instance.run_pipeline(
+            returns_df.copy(), 
+            macro_df.copy()
+        )
+        
         st.session_state['results'] = res_df
         st.session_state['bmda'] = bmda_hist
         st.session_state['bmga'] = bmga_hist
@@ -71,7 +76,6 @@ max_dd = (cum_returns / cum_returns.cummax() - 1).min()
 annual_ret = (cum_returns.iloc[-1] ** (252 / len(res_df))) - 1
 avg_turnover = res_df['Turnover'].mean()
 
-# 頂部 Key Metrics
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("年化夏普值 (Sharpe Ratio)", f"{sharpe:.2f}")
 col2.metric("最大回撤 (Max Drawdown)", f"{max_dd * 100:.2f}%")
@@ -80,13 +84,11 @@ col4.metric("平均每日換手率 (Turnover)", f"{avg_turnover * 100:.2f}%")
 
 st.markdown("---")
 
-# 淨值曲線圖
 st.subheader("📊 策略累積淨值曲線 (Cumulative Wealth Curve)")
 fig_wealth = px.line(cum_returns, labels={"value": "累積淨值", "index": "日期"})
 fig_wealth.update_layout(showlegend=False, height=450)
 st.plotly_chart(fig_wealth, use_container_width=True)
 
-# 動態資產池展示
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("🛡️ 熊市防禦資產池 (BMDA)")
