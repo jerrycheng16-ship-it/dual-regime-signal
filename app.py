@@ -196,12 +196,10 @@ class DualRegimeAllocationModel:
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
-        # 計算絕對動量矩陣
         price_levels = (1 + returns_df_aligned[risky_assets]).cumprod()
         mom_matrix = price_levels / price_levels.shift(self.mom_lookback) - 1
         mom_matrix = mom_matrix.fillna(1.0)
 
-        # 定義股票型資產（在嚴格防禦模式下於熊市時將被強制排除）
         stock_like_assets = ['Nasdaq', 'S&P500']
 
         bmda_sets = {}
@@ -224,13 +222,10 @@ class DualRegimeAllocationModel:
             else:
                 filtered_risky = ml_selected
 
-            # 熊市防禦資產池 (BMDA)
             if is_global_bear:
                 if self.defense_mode == 'Strict':
-                    # 嚴格防禦模式：熊市中強制剔除所有股票型資產 (Nasdaq, S&P500)，只留防禦資產與現金
                     selected_bmda = [a for a in filtered_risky if a not in stock_like_assets]
                 else:
-                    # 彈性防禦模式：允許動量為正的股票型資產
                     selected_bmda = filtered_risky.copy()
                 
                 selected_bmda.append(riskfree_col)
@@ -238,7 +233,6 @@ class DualRegimeAllocationModel:
             else:
                 bmda_sets[d] = [riskfree_col]
                 
-            # 牛市成長資產池 (BMGA)
             if is_global_bull:
                 selected_bmga = filtered_risky.copy()
                 if global_proxy_col not in selected_bmga and global_proxy_col in positive_mom_assets:
@@ -249,7 +243,6 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        # 決定調倉日期
         df_temp = pd.DataFrame(index=dates)
         if self.rebal_freq == 'Monthly':
             df_temp['key'] = df_temp.index.to_period('M')
@@ -303,7 +296,7 @@ class DualRegimeAllocationModel:
 # ==========================================
 # 2. Streamlit 介面與前端展示
 # ==========================================
-st.set_page_config(page_title="雙重狀態資產配置模型 (模式對比版)", layout="wide")
+st.set_page_config(page_title="雙重狀態資產配置系統 (模式對比版)", layout="wide")
 
 st.title("📈 雙重狀態動態資產配置系統 (熊市防禦模式對比)")
 st.caption("支援自由切換【絕對安全防禦（熊市禁股）】與【動量優勢導向（允許動量股）】進行策略效果對比。")
@@ -320,6 +313,7 @@ rebal_freq_option = st.sidebar.selectbox("資產調倉頻率", ["每月調整 (M
 freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
 chosen_freq = freq_mapping[rebal_freq_option]
 
+# 這是切換熊市防禦模式的選單
 defense_option = st.sidebar.selectbox(
     "熊市防禦資產池模式", 
     [
@@ -415,7 +409,6 @@ bmda_hist = st.session_state['bmda']
 bmga_hist = st.session_state['bmga']
 rebal_dates = st.session_state['rebal_dates']
 
-# 績效計算
 cum_returns = (1 + res_df['Return']).cumprod()
 sharpe = (res_df['Return'].mean() * 252) / (res_df['Return'].std() * np.sqrt(252)) if res_df['Return'].std() > 0 else 0
 max_dd = (cum_returns / cum_returns.cummax() - 1).min()
@@ -430,4 +423,71 @@ benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 
 
 st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option})")
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("年
+col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
+col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
+col3.metric("年化報酬率", f"{annual_ret * 100:.2f}%", f"大盤基準: {benchmark_annual_ret * 100:.2f}%")
+col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
+
+st.markdown("---")
+
+st.subheader("📈 累積淨值曲線對比")
+comparison_df = pd.DataFrame({
+    f"動態配置策略 ({chosen_defense_mode})": cum_returns,
+    "S&P 500 (買入持有)": benchmark_cum
+})
+fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
+fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+st.plotly_chart(fig_wealth, use_container_width=True)
+
+st.subheader("🌍 全球市場多空狀態歷史判定圖")
+fig_regime = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.08,
+    row_heights=[0.7, 0.3],
+    subplot_titles=("S&P 500 歷史走勢", "模型預測牛市機率 (Prob Bull)")
+)
+
+sp_prices = (1 + benchmark_returns).cumprod()
+fig_regime.add_trace(
+    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
+    row=1, col=1
+)
+
+bull_probs = res_df['Global_Bull_Prob']
+fig_regime.add_trace(
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+st.subheader(f"📋 資產配置明細表 ({defense_option})")
+st.caption("以下僅列出符合條件且進行【重新調倉】的歷史資產配置紀錄：")
+
+table_data = []
+for d in res_df.index:
+    if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
+        prob = res_df.loc[d, 'Global_Bull_Prob']
+        is_bear = prob < (1.0 - prob_thresh)
+        regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
+        assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
+        
+        table_data.append({
+            "調倉日期": d.strftime('%Y-%m-%d'),
+            "牛市預測機率": f"{prob:.4f}",
+            "市場判定狀態": regime_str,
+            "過濾後配置資產池": ", ".join(assets)
+        })
+
+df_table = pd.DataFrame(table_data)
+st.dataframe(df_table, use_container_width=True, height=400)
