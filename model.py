@@ -100,7 +100,6 @@ class DualRegimeAllocationModel:
         X_min = extract_minimalist_features(returns_df)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
-        # 確保對齊後的特徵與報酬率資料索引完全一致
         common_idx = X_comp.index.intersection(returns_df.index)
         X_comp = X_comp.loc[common_idx]
         returns_df_aligned = returns_df.loc[common_idx]
@@ -109,10 +108,9 @@ class DualRegimeAllocationModel:
         risky_assets = [c for c in returns_df_aligned.columns if c not in [global_proxy_col, riskfree_col]]
         dates = common_idx
         
-        # Step 1: SJM 狀態識別
         global_min_feat = [c for c in X_comp.columns if global_proxy_col in c]
         if not global_min_feat:
-            global_min_feat = X_comp.columns[:3] # 防禦性 fallback
+            global_min_feat = list(X_comp.columns[:3])
             
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_comp[global_min_feat].values)
@@ -137,9 +135,7 @@ class DualRegimeAllocationModel:
             
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
-        # Step 2: 分類器訓練與機率預測
-        y_global = pd.Series(global_regimes_label, index=dates).shift(-1).fillna(method='ffill')
-        
+        y_global = pd.Series(global_regimes_label, index=dates).shift(-1).ffill().fillna(0)
         X_train_g = X_comp.iloc[:-1].values
         y_train_g = y_global.iloc[:-1].values.astype(int)
         
@@ -154,7 +150,7 @@ class DualRegimeAllocationModel:
         for a in risky_assets:
             if a not in asset_regimes_label_df.columns:
                 continue
-            y_asset = asset_regimes_label_df[a].shift(-1).fillna(method='ffill')
+            y_asset = asset_regimes_label_df[a].shift(-1).ffill().fillna(0)
             X_train_a = X_comp.iloc[:-1].values
             y_train_a = y_asset.iloc[:-1].values.astype(int)
             
@@ -164,7 +160,6 @@ class DualRegimeAllocationModel:
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
-        # 建立資產池
         bmda_sets = {}
         bmga_sets = {}
         
@@ -194,7 +189,6 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        # Step 3: 回測計算
         portfolio_returns = []
         tc_rate = 0.0010
         prev_weights = pd.Series(0.0, index=returns_df_aligned.columns)
