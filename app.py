@@ -16,7 +16,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組 (完美隔離 RiskFree)
+# 1. 核心模型模組 (支援熊市防禦模式切換)
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -89,13 +89,14 @@ def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
 
 
 class DualRegimeAllocationModel:
-    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63, rebalance_freq='Monthly', momentum_lookback=63):
+    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63, rebalance_freq='Monthly', momentum_lookback=63, defense_mode='Strict'):
         self.jp_global = float(jump_penalty_global)
         self.jp_asset = float(jump_penalty_asset)
         self.threshold = float(prob_threshold)
         self.ewm_window = int(ewm_window)
         self.rebal_freq = rebalance_freq
         self.mom_lookback = int(momentum_lookback)
+        self.defense_mode = defense_mode  # 'Strict'（熊市嚴禁股票） 或 'Flexible'（允許動量為正的股票）
         
     def _create_classifier(self):
         if USE_XGB:
@@ -195,10 +196,13 @@ class DualRegimeAllocationModel:
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
-        # 嚴格確保只對「風險資產 (risky_assets)」計算絕對動量，徹底排除 RiskFree
+        # 計算絕對動量矩陣
         price_levels = (1 + returns_df_aligned[risky_assets]).cumprod()
         mom_matrix = price_levels / price_levels.shift(self.mom_lookback) - 1
         mom_matrix = mom_matrix.fillna(1.0)
+
+        # 定義股票型資產（在嚴格防禦模式下於熊市時將被強制排除）
+        stock_like_assets = ['Nasdaq', 'S&P500']
 
         bmda_sets = {}
         bmga_sets = {}
@@ -220,15 +224,21 @@ class DualRegimeAllocationModel:
             else:
                 filtered_risky = ml_selected
 
-            # 熊市防禦資產池：動量為正的風險資產 + RiskFree 現金
+            # 熊市防禦資產池 (BMDA)
             if is_global_bear:
-                selected_bmda = filtered_risky.copy()
+                if self.defense_mode == 'Strict':
+                    # 嚴格防禦模式：熊市中強制剔除所有股票型資產 (Nasdaq, S&P500)，只留防禦資產與現金
+                    selected_bmda = [a for a in filtered_risky if a not in stock_like_assets]
+                else:
+                    # 彈性防禦模式：允許動量為正的股票型資產
+                    selected_bmda = filtered_risky.copy()
+                
                 selected_bmda.append(riskfree_col)
                 bmda_sets[d] = selected_bmda
             else:
                 bmda_sets[d] = [riskfree_col]
                 
-            # 牛市成長資產池：動量為正的風險資產 + S&P500
+            # 牛市成長資產池 (BMGA)
             if is_global_bull:
                 selected_bmga = filtered_risky.copy()
                 if global_proxy_col not in selected_bmga and global_proxy_col in positive_mom_assets:
@@ -293,10 +303,10 @@ class DualRegimeAllocationModel:
 # ==========================================
 # 2. Streamlit 介面與前端展示
 # ==========================================
-st.set_page_config(page_title="雙重狀態資產配置模型 (動量強化版)", layout="wide")
+st.set_page_config(page_title="雙重狀態資產配置模型 (模式對比版)", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統 (絕對動量濾網強化版)")
-st.caption("結合 SJM、機器學習與【絕對動量濾網】，自動過濾下跌資產，提升防禦能力。")
+st.title("📈 雙重狀態動態資產配置系統 (熊市防禦模式對比)")
+st.caption("支援自由切換【絕對安全防禦（熊市禁股）】與【動量優勢導向（允許動量股）】進行策略效果對比。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -305,10 +315,20 @@ default_end = pd.to_datetime("2025-12-31")
 start_date = st.sidebar.date_input("回測開始日期", default_start)
 end_date = st.sidebar.date_input("回測結束日期", default_end)
 
-st.sidebar.header("⚙️ 模型參數設定")
+st.sidebar.header("⚙️ 模型與策略模式設定")
 rebal_freq_option = st.sidebar.selectbox("資產調倉頻率", ["每月調整 (Monthly)", "每週調整 (Weekly)", "每日調整 (Daily)"], index=0)
 freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
 chosen_freq = freq_mapping[rebal_freq_option]
+
+defense_option = st.sidebar.selectbox(
+    "熊市防禦資產池模式", 
+    [
+        "絕對安全防禦 (Strict: 熊市嚴禁股票類資產)", 
+        "動量優勢導向 (Flexible: 允許動量為正的股票)"
+    ], 
+    index=0
+)
+chosen_defense_mode = 'Strict' if "Strict" in defense_option else 'Flexible'
 
 mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
 jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
@@ -316,7 +336,7 @@ jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, 
 prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
 ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
-run_button = st.sidebar.button("🚀 執行升級版回測")
+run_button = st.sidebar.button("🚀 執行模式對比回測")
 
 @st.cache_data(ttl=86400)
 def fetch_real_market_data():
@@ -372,14 +392,15 @@ if returns_df.empty or len(returns_df) < 30:
     st.stop()
 
 if run_button or 'results' not in st.session_state:
-    with st.spinner(f"模型運算與動量過濾中 (調倉頻率：{rebal_freq_option})..."):
+    with st.spinner(f"模型運算中 (模式：{defense_option})..."):
         model_instance = DualRegimeAllocationModel(
             jump_penalty_global=float(jp_global),
             jump_penalty_asset=float(jp_asset),
             prob_threshold=float(prob_thresh),
             ewm_window=int(ewm_win),
             rebalance_freq=chosen_freq,
-            momentum_lookback=int(mom_lb)
+            momentum_lookback=int(mom_lb),
+            defense_mode=chosen_defense_mode
         )
         res_df, bmda_hist, bmga_hist, rebal_dates = model_instance.run_pipeline(
             returns_df.copy(), macro_df.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
@@ -407,73 +428,6 @@ benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() *
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
 benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
-st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option} + 動量濾網)")
+st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option})")
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
-col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
-col3.metric("年化報酬率", f"{annual_ret * 100:.2f}%", f"大盤基準: {benchmark_annual_ret * 100:.2f}%")
-col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
-
-st.markdown("---")
-
-st.subheader("📈 累積淨值曲線對比")
-comparison_df = pd.DataFrame({
-    f"動態配置策略 ({rebal_freq_option})": cum_returns,
-    "S&P 500 (買入持有)": benchmark_cum
-})
-fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
-fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-st.plotly_chart(fig_wealth, use_container_width=True)
-
-st.subheader("🌍 全球市場多空狀態歷史判定圖")
-fig_regime = make_subplots(
-    rows=2, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.08,
-    row_heights=[0.7, 0.3],
-    subplot_titles=("S&P 500 歷史走勢", "模型預測牛市機率 (Prob Bull)")
-)
-
-sp_prices = (1 + benchmark_returns).cumprod()
-fig_regime.add_trace(
-    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
-    row=1, col=1
-)
-
-bull_probs = res_df['Global_Bull_Prob']
-fig_regime.add_trace(
-    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
-    row=2, col=1
-)
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
-
-fig_regime.update_layout(
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_regime, use_container_width=True)
-
-st.markdown("---")
-
-st.subheader(f"📋 動量過濾後的調倉紀錄與資產配置明細表 ({rebal_freq_option})")
-st.caption("以下僅列出符合【絕對動量條件（過去一段時間報酬率 > 0）】且進行【重新調倉】的歷史資產配置：")
-
-table_data = []
-for d in res_df.index:
-    if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
-        prob = res_df.loc[d, 'Global_Bull_Prob']
-        is_bear = prob < (1.0 - prob_thresh)
-        regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-        assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
-        
-        table_data.append({
-            "調倉日期": d.strftime('%Y-%m-%d'),
-            "牛市預測機率": f"{prob:.4f}",
-            "市場判定狀態": regime_str,
-            "過濾後配置資產池": ", ".join(assets)
-        })
-
-df_table = pd.DataFrame(table_data)
-st.dataframe(df_table, use_container_width=True, height=400)
+col1.metric("年
