@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.spatial.distance import cdist
+from sklearn.preprocessing import StandardScaler
 
 try:
     from xgboost import XGBClassifier
@@ -78,7 +79,12 @@ def extract_minimalist_features(returns_df):
             features[f'{col}_downside_{hl}'] = downside_std
             features[f'{col}_sortino_{hl}'] = sortino
             
-    return pd.DataFrame(features, index=returns_df.index).dropna()
+    df_feat = pd.DataFrame(features, index=returns_df.index).dropna()
+    
+    # 進行特徵標準化 (StandardScaler)，避免數值範圍懸殊導致 SJM 失效
+    scaler = StandardScaler()
+    scaled_vals = scaler.fit_transform(df_feat.values)
+    return pd.DataFrame(scaled_vals, index=df_feat.index, columns=df_feat.columns)
 
 
 class DualRegimeAllocationModel:
@@ -90,19 +96,24 @@ class DualRegimeAllocationModel:
         
     def _create_classifier(self):
         if USE_XGB:
-            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42, eval_metric='logloss')
+            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42, eval_metric='logloss', scale_pos_weight=1.0)
         else:
             return XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
 
     def _safe_fit_predict_proba(self, X_train, y_train, X_all):
+        # 確保訓練集同時包含 0 與 1，避免全單一類別導致機率貼平
         unique_classes = np.unique(y_train)
         if len(unique_classes) < 2:
             y_train = y_train.copy()
-            y_train[0] = 1 if unique_classes[0] == 0 else 0
+            # 強制製造平衡樣本以防崩潰
+            mid = len(y_train) // 2
+            y_train[:mid] = 0
+            y_train[mid:] = 1
             
         clf = self._create_classifier()
         clf.fit(X_train, y_train)
-        return clf.predict_proba(X_all)[:, 1]
+        probs = clf.predict_proba(X_all)
+        return probs[:, 1] if probs.shape[1] > 1 else np.full(len(X_all), 0.5)
 
     def run_pipeline(self, returns_df, macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
         X_min = extract_minimalist_features(returns_df)
@@ -122,13 +133,20 @@ class DualRegimeAllocationModel:
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_comp[global_min_feat].values)
         
-        ret_g0 = returns_df_aligned.loc[dates, global_proxy_col][global_states == 0].mean()
-        ret_g1 = returns_df_aligned.loc[dates, global_proxy_col][global_states == 1].mean()
-        global_bull_state = 1 if ret_g1 > ret_g0 else 0
-        global_regimes_label = (global_states == global_bull_state).astype(int)
+        # 強化多空標籤：結合 SJM 狀態與 S&P 500 移動平均趨勢，確保 0 與 1 分布均衡
+        sp_series = returns_df_aligned.loc[dates, global_proxy_col]
+        sp_sma = sp_series.rolling(window=50, min_periods=1).mean()
+        trend_label = (sp_series > sp_sma).astype(int).values
         
+        ret_g0 = sp_series[global_states == 0].mean()
+        ret_g1 = sp_series[global_states == 1].mean()
+        sjm_bull_state = 1 if ret_g1 > ret_g0 else 0
+        sjm_label = (global_states == sjm_bull_state).astype(int)
+        
+        # 綜合多空標籤（確保有足夠的牛熊交替）
+        global_regimes_label = np.where((trend_label == 1) | (sjm_label == 1), 1, 0)
         if len(np.unique(global_regimes_label)) < 2:
-            global_regimes_label = (returns_df_aligned[global_proxy_col] > returns_df_aligned[global_proxy_col].median()).astype(int).values
+            global_regimes_label = (sp_series > sp_series.median()).astype(int).values
 
         asset_regimes_label = {}
         for a in risky_assets:
@@ -137,13 +155,18 @@ class DualRegimeAllocationModel:
                 continue
             sjm_asset = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_asset)
             a_states = sjm_asset.fit_predict(X_comp[a_min_feat].values)
+            a_series = returns_df_aligned.loc[dates, a]
+            a_sma = a_series.rolling(window=50, min_periods=1).mean()
+            a_trend = (a_series > a_sma).astype(int).values
             
-            ret_a0 = returns_df_aligned.loc[dates, a][a_states == 0].mean()
-            ret_a1 = returns_df_aligned.loc[dates, a][a_states == 1].mean()
+            ret_a0 = a_series[a_states == 0].mean()
+            ret_a1 = a_series[a_states == 1].mean()
             a_bull_state = 1 if ret_a1 > ret_a0 else 0
-            a_label = (a_states == a_bull_state).astype(int)
+            a_sjm = (a_states == a_bull_state).astype(int)
+            
+            a_label = np.where((a_trend == 1) | (a_sjm == 1), 1, 0)
             if len(np.unique(a_label)) < 2:
-                a_label = (returns_df_aligned[a] > returns_df_aligned[a].median()).astype(int).values
+                a_label = (a_series > a_series.median()).astype(int).values
             asset_regimes_label[a] = a_label
             
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
