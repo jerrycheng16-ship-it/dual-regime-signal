@@ -412,7 +412,8 @@ rebal_dates = st.session_state['rebal_dates']
 # 3. 顯示網頁頂端：最近一期訊號與建議配置
 # ==========================================
 st.markdown("---")
-st.subheader("🎯 最近一期市場訊號與建議配置")
+period_name = "最近一周" if chosen_freq == "Weekly" else ("最近一月" if chosen_freq == "Monthly" else "最近一日")
+st.subheader(f"🎯 依據【{rebal_freq_option}】產生的{period_name}市場訊號與建議配置")
 
 latest_date = res_df.index[-1]
 latest_prob = res_df.loc[latest_date, 'Global_Bull_Prob']
@@ -421,7 +422,7 @@ latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成
 latest_assets = bmda_hist.get(latest_date, []) if is_latest_bear else bmga_hist.get(latest_date, [])
 
 c1, c2, c3 = st.columns(3)
-c1.metric("最新訊號日期 (生效日)", latest_date.strftime('%Y-%m-%d'))
+c1.metric("訊號生效起始日", latest_date.strftime('%Y-%m-%d'))
 c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
 c3.metric("建議配置資產池", ", ".join(latest_assets))
 st.markdown("---")
@@ -499,38 +500,4 @@ fig_regime.add_trace(
 
 bull_probs = res_df['Global_Bull_Prob']
 fig_regime.add_trace(
-    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
-    row=2, col=1
-)
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
-
-fig_regime.update_layout(
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_regime, use_container_width=True)
-
-st.markdown("---")
-
-st.subheader(f"📋 資產配置明細表 ({defense_option})")
-st.caption("以下僅列出符合條件且進行【重新調倉】的歷史資產配置紀錄：")
-
-table_data = []
-for d in res_df.index:
-    if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
-        prob = res_df.loc[d, 'Global_Bull_Prob']
-        is_bear = prob < (1.0 - prob_thresh)
-        regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-        assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
-        
-        table_data.append({
-            "調倉日期": d.strftime('%Y-%m-%d'),
-            "牛市預測機率": f"{prob:.4f}",
-            "市場判定狀態": regime_str,
-            "過濾後配置資產池": ", ".join(assets)
-        })
-
-df_table = pd.DataFrame(table_data)
-st.dataframe(df_table, use_container_width=True, height=400)
+    go.Scatter(x=bull_
