@@ -16,7 +16,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組 (Statistical Jump Model & Pipeline)
+# 1. 核心模型模組
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -64,9 +64,11 @@ class StatisticalJumpModel:
         return states
 
 
-def extract_minimalist_features(returns_df):
+def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
+    # 排除無風險利率，只對有波動的風險資產計算特徵
+    risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
-    for col in returns_df.columns:
+    for col in risky_cols:
         r = returns_df[col]
         for hl in [1, 5, 10, 21]:
             alpha = 1 - np.exp(-np.log(2) / hl)
@@ -81,7 +83,9 @@ def extract_minimalist_features(returns_df):
             
     df_feat = pd.DataFrame(features, index=returns_df.index).dropna()
     
-    # 進行特徵標準化 (StandardScaler)，避免數值範圍懸殊導致 SJM 失效
+    # 過濾掉變異數為 0 的欄位，避免標準化報錯
+    df_feat = df_feat.loc[:, df_feat.var() > 1e-8]
+    
     scaler = StandardScaler()
     scaled_vals = scaler.fit_transform(df_feat.values)
     return pd.DataFrame(scaled_vals, index=df_feat.index, columns=df_feat.columns)
@@ -96,16 +100,14 @@ class DualRegimeAllocationModel:
         
     def _create_classifier(self):
         if USE_XGB:
-            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42, eval_metric='logloss', scale_pos_weight=1.0)
+            return XGBClassifier(n_estimators=100, max_depth=3, random_state=42, eval_metric='logloss')
         else:
             return XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
 
     def _safe_fit_predict_proba(self, X_train, y_train, X_all):
-        # 確保訓練集同時包含 0 與 1，避免全單一類別導致機率貼平
         unique_classes = np.unique(y_train)
         if len(unique_classes) < 2:
             y_train = y_train.copy()
-            # 強制製造平衡樣本以防崩潰
             mid = len(y_train) // 2
             y_train[:mid] = 0
             y_train[mid:] = 1
@@ -116,7 +118,7 @@ class DualRegimeAllocationModel:
         return probs[:, 1] if probs.shape[1] > 1 else np.full(len(X_all), 0.5)
 
     def run_pipeline(self, returns_df, macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
-        X_min = extract_minimalist_features(returns_df)
+        X_min = extract_minimalist_features(returns_df, riskfree_col=riskfree_col)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
         common_idx = X_comp.index.intersection(returns_df.index)
@@ -133,7 +135,6 @@ class DualRegimeAllocationModel:
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_comp[global_min_feat].values)
         
-        # 強化多空標籤：結合 SJM 狀態與 S&P 500 移動平均趨勢，確保 0 與 1 分布均衡
         sp_series = returns_df_aligned.loc[dates, global_proxy_col]
         sp_sma = sp_series.rolling(window=50, min_periods=1).mean()
         trend_label = (sp_series > sp_sma).astype(int).values
@@ -143,7 +144,6 @@ class DualRegimeAllocationModel:
         sjm_bull_state = 1 if ret_g1 > ret_g0 else 0
         sjm_label = (global_states == sjm_bull_state).astype(int)
         
-        # 綜合多空標籤（確保有足夠的牛熊交替）
         global_regimes_label = np.where((trend_label == 1) | (sjm_label == 1), 1, 0)
         if len(np.unique(global_regimes_label)) < 2:
             global_regimes_label = (sp_series > sp_series.median()).astype(int).values
@@ -266,7 +266,6 @@ st.set_page_config(page_title="雙重狀態資產配置模型", layout="wide")
 st.title("📈 雙重狀態動態資產配置系統 (真實歷史數據回測)")
 st.caption("基於 Luo & Mulvey (2026) 論文實作，結合 SJM 與 XGBoost 進行多空動態配置與牛熊市歷史視覺化。")
 
-# 側邊欄設定
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
 default_end = pd.to_datetime("2025-12-31")
@@ -352,7 +351,6 @@ if run_button or 'results' not in st.session_state:
 
 res_df = st.session_state['results']
 
-# 績效計算
 cum_returns = (1 + res_df['Return']).cumprod()
 sharpe = (res_df['Return'].mean() * 252) / (res_df['Return'].std() * np.sqrt(252)) if res_df['Return'].std() > 0 else 0
 max_dd = (cum_returns / cum_returns.cummax() - 1).min()
@@ -374,7 +372,6 @@ col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
 
 st.markdown("---")
 
-# 淨值曲線對比圖
 st.subheader("📈 累積淨值曲線對比")
 comparison_df = pd.DataFrame({
     "雙重狀態動態配置策略": cum_returns,
@@ -384,7 +381,6 @@ fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "�
 fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 st.plotly_chart(fig_wealth, use_container_width=True)
 
-# 牛熊市歷史狀態判定圖
 st.subheader("🌍 全球市場多空狀態歷史判定圖 (Regime Shifting)")
 st.caption("上方為 S&P 500 走勢，下方為模型預測的每日牛市機率，助您一眼識別歷史多空轉折點。")
 
@@ -417,7 +413,6 @@ fig_regime.update_layout(
 )
 st.plotly_chart(fig_regime, use_container_width=True)
 
-# 動態資產池展示
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("🛡️ 熊市防禦資產池 (BMDA)")
@@ -432,9 +427,6 @@ with col_b:
 
 st.markdown("---")
 
-# ==========================================
-# 主畫面下方的詳細系統說明文件 (README)
-# ==========================================
 st.header("📖 系統說明與真實資產清單 (README)")
 st.markdown("歡迎使用 **雙重狀態動態資產配置系統**。以下為本系統的核心架構、參數設定與真實資產清單說明。")
 
