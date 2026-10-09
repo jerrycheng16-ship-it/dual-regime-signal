@@ -243,13 +243,23 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
+        # ---------------------------------------------------------
+        # 精準設定調倉日規則：
+        # Monthly: 每個月最後一個交易日
+        # Weekly: 每週五（或當週最後一個交易日）
+        # Daily: 每日
+        # ---------------------------------------------------------
         df_temp = pd.DataFrame(index=dates)
         if self.rebal_freq == 'Monthly':
             df_temp['key'] = df_temp.index.to_period('M')
             rebal_dates = set(df_temp.groupby('key').apply(lambda x: x.index[-1]))
         elif self.rebal_freq == 'Weekly':
-            df_temp['key'] = df_temp.index.to_period('W')
-            rebal_dates = set(df_temp.groupby('key').apply(lambda x: x.index[-1]))
+            df_temp['weekday'] = df_temp.index.weekday # 4 代表星期五
+            df_temp['year_week'] = df_temp.index.isocalendar().week
+            # 抓取每週星期五的交易日；若當週五剛好休市，則抓當週最後一個交易日
+            rebal_dates = set(df_temp[df_temp['weekday'] == 4].index).union(
+                set(df_temp.groupby('year_week').apply(lambda x: x.index[-1]))
+            )
         else:
             rebal_dates = set(dates)
 
@@ -413,10 +423,9 @@ raw_sp_prices = (1 + returns_df['S&P500']).cumprod()
 # 3. 顯示網頁頂端：最近一個完整週期的訊號與建議配置
 # ==========================================
 st.markdown("---")
-period_name = "最近一週" if chosen_freq == "Weekly" else ("最近一月" if chosen_freq == "Monthly" else "最近一日")
+period_name = "最近一週 (每週五結算)" if chosen_freq == "Weekly" else ("最近一月 (每月月底結算)" if chosen_freq == "Monthly" else "最近一日")
 st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
 
-# 找出最後一個調倉日（即當前生效週期的訊號來源日）
 sorted_rebal_dates = sorted(list(rebal_dates))
 latest_rebal_date = sorted_rebal_dates[-1] if sorted_rebal_dates else res_df.index[-1]
 
@@ -425,8 +434,8 @@ is_latest_bear = latest_prob < (1.0 - prob_thresh)
 latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成長 (BMGA)"
 latest_assets = bmda_hist.get(latest_rebal_date, []) if is_latest_bear else bmga_hist.get(latest_rebal_date, [])
 
-c1, c2, c3 = c4 = st.columns(3)
-c1.metric("當前週期訊號生成日", latest_rebal_date.strftime('%Y-%m-%d'))
+c1, c2, c3 = st.columns(3)
+c1.metric("當前週期訊號生成日 (調倉日)", latest_rebal_date.strftime('%Y-%m-%d'))
 c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
 c3.metric("建議配置資產池", ", ".join(latest_assets))
 st.markdown("---")
@@ -446,14 +455,12 @@ benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() *
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
 benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
-# 建立調倉日清單以計算每期區間報酬
 rebal_list = sorted([d for d in res_df.index if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily'])
 
-# 計算多空預測勝率（基於各調倉週期的區間報酬）
 correct_count = 0
 total_count = 0
-
 period_records = []
+
 for i in range(len(rebal_list)):
     d_start = rebal_list[i]
     d_end = rebal_list[i+1] if i < len(rebal_list) - 1 else res_df.index[-1]
@@ -463,7 +470,6 @@ for i in range(len(rebal_list)):
         
     prob = res_df.loc[d_start, 'Global_Bull_Prob']
     
-    # 計算 S&P 500 在該持有區間內的累積報酬率
     sp_slice = raw_sp_prices.loc[d_start:d_end]
     if len(sp_slice) > 1:
         period_sp_ret = (sp_slice.iloc[-1] / sp_slice.iloc[0]) - 1.0
@@ -474,88 +480,4 @@ for i in range(len(rebal_list)):
     is_up = period_sp_ret > 0
     is_down = period_sp_ret < 0
     
-    if (is_bull_pred and is_up) or (not is_bull_pred and is_down):
-        eval_result = "✅ 正確"
-        correct_count += 1
-        total_count += 1
-    elif period_sp_ret == 0:
-        eval_result = "➖ 持平"
-    else:
-        eval_result = "❌ 錯誤"
-        total_count += 1
-        
-    is_bear = prob < (1.0 - prob_thresh)
-    regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-    assets = bmda_hist.get(d_start, []) if is_bear else bmga_hist.get(d_start, [])
-    
-    period_records.append({
-        "調倉日期": d_start.strftime('%Y-%m-%d'),
-        "持有至": d_end.strftime('%Y-%m-%d'),
-        "牛市預測機率": f"{prob:.4f}",
-        "市場判定狀態": regime_str,
-        "S&P500 區間報酬率": f"{period_sp_ret * 100:.2f}%",
-        "預測驗證": eval_result,
-        "過濾後配置資產池": ", ".join(assets)
-    })
-
-win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
-
-st.subheader(f"📊 核心績效指標與預測勝率 ({rebal_freq_option})")
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
-col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
-col3.metric("年化報酬率", f"{annual_ret * 100:.2f}%", f"大盤基準: {benchmark_annual_ret * 100:.2f}%")
-col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
-col5.metric("多空預測勝率", f"{win_rate:.2f}%", f"正確數: {correct_count}/{total_count}")
-
-st.markdown("---")
-
-st.subheader("📈 累積淨值曲線對比")
-comparison_df = pd.DataFrame({
-    f"動態配置策略 ({chosen_defense_mode})": cum_returns,
-    "S&P 500 (買入持有)": benchmark_cum
-})
-fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
-fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-st.plotly_chart(fig_wealth, use_container_width=True)
-
-st.subheader("🌍 全球市場多空狀態歷史判定圖")
-fig_regime = make_subplots(
-    rows=2, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.08,
-    row_heights=[0.7, 0.3],
-    subplot_titles=("S&P 500 歷史走勢", "模型預測牛市機率 (Prob Bull)")
-)
-
-sp_prices = (1 + benchmark_returns).cumprod()
-fig_regime.add_trace(
-    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
-    row=1, col=1
-)
-
-bull_probs = res_df['Global_Bull_Prob']
-fig_regime.add_trace(
-    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
-    row=2, col=1
-)
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
-
-fig_regime.update_layout(
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_regime, use_container_width=True)
-
-st.markdown("---")
-
-# ==========================================
-# 5. 資產配置明細表：顯示區間報酬與勝負驗證
-# ==========================================
-st.subheader(f"📋 調倉週期、S&P 500 區間報酬率與預測驗證明細表 ({rebal_freq_option})")
-st.caption("以下列出每一個調倉週期的生效日與持有區間，並對比該區間內 S&P 500 的實際累積報酬率來客觀驗證預測勝率：")
-
-df_table = pd.DataFrame(period_records)
-st.dataframe(df_table, use_container_width=True, height=400)
+    if (is_bull_pred and is
