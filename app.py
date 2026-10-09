@@ -16,7 +16,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組 (支援彈性調倉頻率)
+# 1. 核心模型模組 (含絕對動量濾網)
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -89,12 +89,13 @@ def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
 
 
 class DualRegimeAllocationModel:
-    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63, rebalance_freq='Monthly'):
+    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63, rebalance_freq='Monthly', momentum_lookback=63):
         self.jp_global = float(jump_penalty_global)
         self.jp_asset = float(jump_penalty_asset)
         self.threshold = float(prob_threshold)
         self.ewm_window = int(ewm_window)
         self.rebal_freq = rebalance_freq  # 'Daily', 'Weekly', 'Monthly'
+        self.mom_lookback = int(momentum_lookback)  # 絕對動量回看天數 (預設 63 天約一季)
         
     def _create_classifier(self):
         if USE_XGB:
@@ -194,6 +195,11 @@ class DualRegimeAllocationModel:
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
+        # 計算資產的絕對動量（過去 mom_lookback 天的累積報酬率是否大於 0）
+        price_levels = (1 + returns_df_aligned[risky_assets]).cumprod()
+        mom_matrix = price_levels / price_levels.shift(self.mom_lookback) - 1
+        mom_matrix = mom_matrix.fillna(1.0) # 剛開始天數不足時預設為正
+
         bmda_sets = {}
         bmga_sets = {}
         
@@ -202,30 +208,39 @@ class DualRegimeAllocationModel:
             is_global_bear = pred_global_bear[t] == 1
             is_global_bull = pred_global_bull[t] == 1
             
+            # 模型選出的資產
             if d in smoothed_prob_asset_df.index:
                 asset_bulls = smoothed_prob_asset_df.loc[d] > self.threshold
-                selected_risky = asset_bulls[asset_bulls].index.tolist()
+                ml_selected = asset_bulls[asset_bulls].index.tolist()
             else:
-                selected_risky = []
+                ml_selected = []
             
+            # 引入絕對動量濾網：強制過濾掉過去一段時間累積報酬率 <= 0 的資產（不接下墜飛刀）
+            if d in mom_matrix.index:
+                positive_mom_assets = mom_matrix.loc[d][mom_matrix.loc[d] > 0.0].index.tolist()
+                filtered_risky = [a for a in ml_selected if a in positive_mom_assets]
+            else:
+                filtered_risky = ml_selected
+
             if is_global_bear:
-                selected_bmda = selected_risky.copy()
+                selected_bmda = filtered_risky.copy()
                 selected_bmda.append(riskfree_col)
                 bmda_sets[d] = selected_bmda
             else:
                 bmda_sets[d] = [riskfree_col]
                 
             if is_global_bull:
-                selected_bmga = selected_risky.copy()
-                if global_proxy_col not in selected_bmga:
+                selected_bmga = filtered_risky.copy()
+                if global_proxy_col not in selected_bmga and global_proxy_col in positive_mom_assets:
                     selected_bmga.append(global_proxy_col)
+                # 若大盤動量也小於 0，強制退守至 RiskFree
+                if not selected_bmga or global_proxy_col not in selected_bmga:
+                    selected_bmga = [riskfree_col]
                 bmga_sets[d] = selected_bmga
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        # ---------------------------------------------------------
-        # 決定調倉日期 (Rebalancing Dates)
-        # ---------------------------------------------------------
+        # 決定調倉日期
         df_temp = pd.DataFrame(index=dates)
         if self.rebal_freq == 'Monthly':
             df_temp['key'] = df_temp.index.to_period('M')
@@ -279,10 +294,10 @@ class DualRegimeAllocationModel:
 # ==========================================
 # 2. Streamlit 介面與前端展示
 # ==========================================
-st.set_page_config(page_title="雙重狀態資產配置模型", layout="wide")
+st.set_page_config(page_title="雙重狀態資產配置模型 (動量強化版)", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統 (彈性調倉頻率版)")
-st.caption("支援【每日調整】、【每週調整】與【每月調整】三種回測頻率。")
+st.title("📈 雙重狀態動態資產配置系統 (絕對動量濾網強化版)")
+st.caption("結合 SJM、機器學習與【絕對動量濾網】，自動過濾下跌資產，提升防禦能力。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -296,12 +311,13 @@ rebal_freq_option = st.sidebar.selectbox("資產調倉頻率", ["每月調整 (M
 freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
 chosen_freq = freq_mapping[rebal_freq_option]
 
+mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
 jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
 jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
 prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
 ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
-run_button = st.sidebar.button("🚀 執行回測")
+run_button = st.sidebar.button("🚀 執行升級版回測")
 
 @st.cache_data(ttl=86400)
 def fetch_real_market_data():
@@ -357,13 +373,14 @@ if returns_df.empty or len(returns_df) < 30:
     st.stop()
 
 if run_button or 'results' not in st.session_state:
-    with st.spinner(f"模型運算中 (調倉頻率：{rebal_freq_option})..."):
+    with st.spinner(f"模型運算與動量過濾中 (調倉頻率：{rebal_freq_option})..."):
         model_instance = DualRegimeAllocationModel(
             jump_penalty_global=float(jp_global),
             jump_penalty_asset=float(jp_asset),
             prob_threshold=float(prob_thresh),
             ewm_window=int(ewm_win),
-            rebalance_freq=chosen_freq
+            rebalance_freq=chosen_freq,
+            momentum_lookback=int(mom_lb)
         )
         res_df, bmda_hist, bmga_hist, rebal_dates = model_instance.run_pipeline(
             returns_df.copy(), macro_df.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
@@ -391,7 +408,7 @@ benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() *
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
 benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
-st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option})")
+st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option} + 動量濾網)")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
 col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
@@ -441,15 +458,12 @@ st.plotly_chart(fig_regime, use_container_width=True)
 
 st.markdown("---")
 
-# ==========================================
-# 明細表：只顯示真正有進行調倉（換倉）的日期
-# ==========================================
-st.subheader(f"📋 調倉紀錄與資產配置明細表 ({rebal_freq_option})")
-st.caption("以下僅列出模型判定需要【重新調倉】（換倉日）的歷史紀錄與對應資產配置：")
+# 明細表
+st.subheader(f"📋 動量過濾後的調倉紀錄與資產配置明細表 ({rebal_freq_option})")
+st.caption("以下僅列出符合【絕對動量條件（過去一段時間報酬率 > 0）】且進行【重新調倉】的歷史資產配置：")
 
 table_data = []
 for d in res_df.index:
-    # 篩選出屬於調倉日的紀錄
     if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
         prob = res_df.loc[d, 'Global_Bull_Prob']
         is_bear = prob < (1.0 - prob_thresh)
@@ -460,7 +474,7 @@ for d in res_df.index:
             "調倉日期": d.strftime('%Y-%m-%d'),
             "牛市預測機率": f"{prob:.4f}",
             "市場判定狀態": regime_str,
-            "配置資產池": ", ".join(assets)
+            "過濾後配置資產池": ", ".join(assets)
         })
 
 df_table = pd.DataFrame(table_data)
