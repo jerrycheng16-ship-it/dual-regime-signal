@@ -63,35 +63,42 @@ def fetch_real_market_data():
     else:
         df_prices = df_raw[['Close']]
 
-    # 重新命名欄位回資產名稱
     inv_tickers_map = {v: k for k, v in tickers_map.items()}
     inv_macro_map = {v: k for k, v in macro_tickers.items()}
     
     rename_dict = {**inv_tickers_map, **inv_macro_map}
     df_prices = df_prices.rename(columns=rename_dict)
     
-    # 計算日報酬率
-    returns_df = df_prices[list(tickers_map.keys())].pct_change().dropna()
-    returns_df['RiskFree'] = 0.0001  # 設定每日無風險利率約 2.5% 年化
+    # 確保只取存在的欄位並移除空值
+    valid_cols = [c for c in tickers_map.keys() if c in df_prices.columns]
+    returns_df = df_prices[valid_cols].pct_change().dropna(how='all')
+    returns_df['RiskFree'] = 0.0001  # 無風險利率代理
     
-    # 總經變數
-    macro_df = df_prices[[k for k in macro_tickers.keys() if k in df_prices.columns]].dropna()
-    # 補上簡單的殖利率曲線與通膨代理變數以符合模型維度
+    # 總經變數對齊
+    macro_cols = [c for c in macro_tickers.keys() if c in df_prices.columns]
+    macro_df = df_prices[macro_cols].reindex(returns_df.index).ffill().bfill()
     macro_df['Yield_Curve'] = 0.5 
     macro_df['Inflation'] = 2.0
     
-    return returns_df, macro_df
+    return returns_df.dropna(), macro_df.dropna()
 
 with st.spinner("正在透過 Yahoo Finance 同步真實全球金融市場與總經歷史數據..."):
     raw_returns_df, raw_macro_df = fetch_real_market_data()
 
-# 根據使用者手動輸入的日期進行篩選
-mask = (raw_returns_df.index >= pd.to_datetime(start_date)) & (raw_returns_df.index <= pd.to_datetime(end_date))
-returns_df = raw_returns_df.loc[mask].dropna(how='all').copy()
-macro_df = raw_macro_df.loc[mask].reindex(returns_df.index).ffill().bfill().copy()
+# 嚴格且安全的日期篩選與對齊
+start_ts = pd.to_datetime(start_date)
+end_ts = pd.to_datetime(end_date)
 
-if returns_df.empty or len(returns_df) < 50:
-    st.error("❌ 選擇的時間區間內真實資料不足（或該區間為週末/假日），請調整回測起訖日期！")
+common_index = raw_returns_df.index.intersection(raw_macro_df.index)
+clean_returns = raw_returns_df.loc[common_index]
+clean_macro = raw_macro_df.loc[common_index]
+
+mask = (clean_returns.index >= start_ts) & (clean_returns.index <= end_ts)
+returns_df = clean_returns.loc[mask].copy()
+macro_df = clean_macro.loc[mask].copy()
+
+if returns_df.empty or len(returns_df) < 30:
+    st.error("❌ 選擇的時間區間內真實資料不足（或該區間為週末/假日），請擴大回測起訖日期！")
     st.stop()
 
 # 執行回測 Pipeline
@@ -126,7 +133,6 @@ max_dd = (cum_returns / cum_returns.cummax() - 1).min()
 annual_ret = (cum_returns.iloc[-1] ** (252 / len(res_df))) - 1 if len(res_df) > 0 else 0
 avg_turnover = res_df['Turnover'].mean()
 
-# S&P 500 (真實大盤基準)
 benchmark_returns = returns_df.loc[res_df.index, 'S&P500']
 benchmark_cum = (1 + benchmark_returns).cumprod()
 benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() * np.sqrt(252)) if benchmark_returns.std() > 0 else 0
@@ -186,12 +192,6 @@ with st.expander("📌 1. 真實數據資產清單與代理代碼", expanded=Tru
     - **HighYield** (`HYG`)：高收益債
     - **Gold** (`GC=F`)：黃金期貨
     - **Commodity** (`DBC`)：大宗商品指數
-    - **REIT** (`VNQ`)：不動產信託
+    - **VNQ** (`VNQ`)：不動產信託
     - **RiskFree**：固定無風險利率代理
-    """)
-
-with st.expander("🛠️ 2. 模型核心運作機制", expanded=False):
-    st.markdown("""
-    - **Statistical Jump Model (SJM)**：動態捕捉真實市場從多頭轉為空頭的結構性跳躍點。
-    - **機器學習分類器**：預測未來市場狀態機率，並動態將資產分配至 **BMDA（防禦資產池）** 或 **BMGA（成長資產池）**。
     """)
