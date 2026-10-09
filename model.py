@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 
-# 防禦性導入：若 xgboost 發生 ImportError，自動備援使用 scikit-learn 的 RandomForest
 try:
     from xgboost import XGBClassifier
     USE_XGB = True
@@ -10,9 +9,6 @@ except ImportError:
     from sklearn.ensemble import RandomForestClassifier as XGBClassifier
     USE_XGB = False
 
-# ==========================================
-# 1. Statistical Jump Model (SJM) 實作
-# ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
         self.n_clusters = n_clusters
@@ -27,12 +23,10 @@ class StatisticalJumpModel:
         np.random.seed(42)
         idx = np.random.choice(T, K, replace=False)
         centroids = X[idx].copy()
-        
         prev_states = np.zeros(T, dtype=int)
         
         for iteration in range(20):
             emission_cost = cdist(X, centroids, metric='sqeuclidean')
-            
             dp = np.zeros((T, K))
             pointers = np.zeros((T, K), dtype=int)
             dp[0] = emission_cost[0]
@@ -61,9 +55,6 @@ class StatisticalJumpModel:
         return states
 
 
-# ==========================================
-# 2. 特徵工程 (Feature Engineering)
-# ==========================================
 def extract_minimalist_features(returns_df):
     features = {}
     for col in returns_df.columns:
@@ -82,9 +73,6 @@ def extract_minimalist_features(returns_df):
     return pd.DataFrame(features, index=returns_df.index).dropna()
 
 
-# ==========================================
-# 3. 雙重狀態預測與 BMDA / BMGA 資產池建立
-# ==========================================
 class DualRegimeAllocationModel:
     def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63):
         self.jp_global = float(jump_penalty_global)
@@ -118,9 +106,6 @@ class DualRegimeAllocationModel:
         risky_assets = [c for c in returns_df.columns if c not in [global_proxy_col, riskfree_col]]
         dates = X_min.index
         
-        # ----------------------------------------------------
-        # Step 1: SJM 狀態識別
-        # ----------------------------------------------------
         global_min_feat = [c for c in X_min.columns if global_proxy_col in c]
         sjm_global = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_global)
         global_states = sjm_global.fit_predict(X_min_vals[global_min_feat].values)
@@ -143,11 +128,7 @@ class DualRegimeAllocationModel:
             
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
-        # ----------------------------------------------------
-        # Step 2: 分類器狀態預測
-        # ----------------------------------------------------
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1)
-        
         X_train_g = X_comp_vals.iloc[:-1].values
         y_train_g = y_global.iloc[:-1].values.astype(int)
         
@@ -163,17 +144,12 @@ class DualRegimeAllocationModel:
             y_asset = asset_regimes_label_df[a].shift(-1)
             X_train_a = X_comp_vals.iloc[:-1].values
             y_train_a = y_asset.iloc[:-1].values.astype(int)
-            
             raw_prob_bull = self._safe_fit_predict_proba(X_train_a, y_train_a, X_comp_vals.values)
-            
             prob_series = pd.Series(raw_prob_bull, index=dates)
             smoothed_prob_asset_bull[a] = prob_series.ewm(alpha=alpha_ewm).mean()
             
         smoothed_prob_asset_df = pd.DataFrame(smoothed_prob_asset_bull)
 
-        # ----------------------------------------------------
-        # 建立 BMDA / BMGA 資產池
-        # ----------------------------------------------------
         bmda_sets = {}
         bmga_sets = {}
         
@@ -181,7 +157,6 @@ class DualRegimeAllocationModel:
             d = dates[t]
             is_global_bear = pred_global_bear[t] == 1
             is_global_bull = pred_global_bull[t] == 1
-            
             asset_bulls = smoothed_prob_asset_df.loc[d] > self.threshold
             
             if is_global_bear:
@@ -199,9 +174,6 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        # ----------------------------------------------------
-        # Step 3: 回測計算
-        # ----------------------------------------------------
         portfolio_returns = []
         tc_rate = 0.0010
         prev_weights = pd.Series(0.0, index=returns_df.columns)
@@ -223,8 +195,12 @@ class DualRegimeAllocationModel:
             
             r_next = returns_df.loc[d_next]
             port_r = np.sum(target_weights * r_next) - tc
-            portfolio_returns.append({'Date': d_next, 'Return': port_r, 'Turnover': turnover})
-            
+            portfolio_returns.append({
+                'Date': d_next, 
+                'Return': port_r, 
+                'Turnover': turnover,
+                'Global_Bull_Prob': prob_global_bull[t]
+            })
             prev_weights = target_weights.copy()
             
         res_df = pd.DataFrame(portfolio_returns).set_index('Date')
