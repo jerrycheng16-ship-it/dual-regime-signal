@@ -16,7 +16,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組
+# 1. 核心模型模組 (支援每月調整頻率)
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -65,7 +65,6 @@ class StatisticalJumpModel:
 
 
 def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
-    # 排除無風險利率，只對有波動的風險資產計算特徵
     risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
     for col in risky_cols:
@@ -82,8 +81,6 @@ def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
             features[f'{col}_sortino_{hl}'] = sortino
             
     df_feat = pd.DataFrame(features, index=returns_df.index).dropna()
-    
-    # 過濾掉變異數為 0 的欄位，避免標準化報錯
     df_feat = df_feat.loc[:, df_feat.var() > 1e-8]
     
     scaler = StandardScaler()
@@ -225,21 +222,34 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
+        # ---------------------------------------------------------
+        # 修改處：實作「每月調整 (Monthly Rebalancing)」機制
+        # ---------------------------------------------------------
         portfolio_returns = []
         tc_rate = 0.0010
         prev_weights = pd.Series(0.0, index=returns_df_aligned.columns)
         
+        # 標記每個月最後一個交易日
+        df_temp = pd.DataFrame(index=dates)
+        df_temp['year_month'] = df_temp.index.to_period('M')
+        rebal_dates = set(df_temp.groupby('year_month').apply(lambda x: x.index[-1]))
+
         for t in range(len(dates) - 1):
             d_today = dates[t]
             d_next = dates[t+1]
             
-            if pred_global_bear[t] == 1:
-                target_assets = bmda_sets.get(d_today, [riskfree_col])
+            # 如果是換倉日（每月最後一個交易日），才重新計算目標權重；否則維持上期權重
+            if t == 0 or d_today in rebal_dates:
+                if pred_global_bear[t] == 1:
+                    target_assets = bmda_sets.get(d_today, [riskfree_col])
+                else:
+                    target_assets = bmga_sets.get(d_today, [global_proxy_col])
+                    
+                target_weights = pd.Series(0.0, index=returns_df_aligned.columns)
+                target_weights[target_assets] = 1.0 / len(target_assets)
             else:
-                target_assets = bmga_sets.get(d_today, [global_proxy_col])
-                
-            target_weights = pd.Series(0.0, index=returns_df_aligned.columns)
-            target_weights[target_assets] = 1.0 / len(target_assets)
+                # 非換倉日，權重維持不變（實現每月調整）
+                target_weights = prev_weights.copy()
             
             turnover = np.sum(np.abs(target_weights - prev_weights))
             tc = turnover * tc_rate
@@ -263,8 +273,8 @@ class DualRegimeAllocationModel:
 # ==========================================
 st.set_page_config(page_title="雙重狀態資產配置模型", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統 (真實歷史數據回測)")
-st.caption("基於 Luo & Mulvey (2026) 論文實作，結合 SJM 與 XGBoost 進行多空動態配置與牛熊市歷史視覺化。")
+st.title("📈 雙重狀態動態資產配置系統 (每月動態調整版)")
+st.caption("基於 Luo & Mulvey (2026) 論文實作，採用【每月結算與資產配置調整】機制以降低交易成本。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -279,7 +289,7 @@ jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, 
 prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
 ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
-run_button = st.sidebar.button("🚀 執行真實數據回測")
+run_button = st.sidebar.button("🚀 執行每月調整回測")
 
 @st.cache_data(ttl=86400)
 def fetch_real_market_data():
@@ -335,7 +345,7 @@ if returns_df.empty or len(returns_df) < 30:
     st.stop()
 
 if run_button or 'results' not in st.session_state:
-    with st.spinner("模型運算中 (SJM + XGBoost)..."):
+    with st.spinner("模型運算與每月配置優化中..."):
         model_instance = DualRegimeAllocationModel(
             jump_penalty_global=float(jp_global),
             jump_penalty_asset=float(jp_asset),
@@ -350,7 +360,10 @@ if run_button or 'results' not in st.session_state:
         st.session_state['bmga'] = bmga_hist
 
 res_df = st.session_state['results']
+bmda_hist = st.session_state['bmda']
+bmga_hist = st.session_state['bmga']
 
+# 績效計算
 cum_returns = (1 + res_df['Return']).cumprod()
 sharpe = (res_df['Return'].mean() * 252) / (res_df['Return'].std() * np.sqrt(252)) if res_df['Return'].std() > 0 else 0
 max_dd = (cum_returns / cum_returns.cummax() - 1).min()
@@ -363,7 +376,7 @@ benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() *
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
 benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
-st.subheader("📊 核心績效指標比較：雙重狀態策略 vs S&P 500")
+st.subheader("📊 核心績效指標比較：每月調整策略 vs S&P 500")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
 col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
@@ -374,7 +387,7 @@ st.markdown("---")
 
 st.subheader("📈 累積淨值曲線對比")
 comparison_df = pd.DataFrame({
-    "雙重狀態動態配置策略": cum_returns,
+    "每月調整動態配置策略": cum_returns,
     "S&P 500 (買入持有)": benchmark_cum
 })
 fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
@@ -382,8 +395,6 @@ fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orienta
 st.plotly_chart(fig_wealth, use_container_width=True)
 
 st.subheader("🌍 全球市場多空狀態歷史判定圖 (Regime Shifting)")
-st.caption("上方為 S&P 500 走勢，下方為模型預測的每日牛市機率，助您一眼識別歷史多空轉折點。")
-
 fig_regime = make_subplots(
     rows=2, cols=1, 
     shared_xaxes=True, 
@@ -413,41 +424,25 @@ fig_regime.update_layout(
 )
 st.plotly_chart(fig_regime, use_container_width=True)
 
-col_a, col_b = st.columns(2)
-with col_a:
-    st.subheader("🛡️ 熊市防禦資產池 (BMDA)")
-    latest_date = list(st.session_state['bmda'].keys())[-1]
-    st.write(f"最新日期 ({latest_date.strftime('%Y-%m-%d')}) 選取資產：")
-    st.success(", ".join(st.session_state['bmda'][latest_date]))
-
-with col_b:
-    st.subheader("🚀 牛市成長資產池 (BMGA)")
-    st.write(f"最新日期 ({latest_date.strftime('%Y-%m-%d')}) 選取資產：")
-    st.info(", ".join(st.session_state['bmga'][latest_date]))
-
 st.markdown("---")
 
-st.header("📖 系統說明與真實資產清單 (README)")
-st.markdown("歡迎使用 **雙重狀態動態資產配置系統**。以下為本系統的核心架構、參數設定與真實資產清單說明。")
+# 明細表
+st.subheader("📋 每月結算與資產配置明細表")
+st.caption("以下列出回測期間內每一個交易日的模型狀態與持倉明細（改為每月動態調整）：")
 
-st.info("`#Real-Data` `#Yahoo-Finance` `#Quantitative-Strategy` `#Asset-Allocation` `#Python` `#Streamlit`")
+table_data = []
+for d in res_df.index:
+    prob = res_df.loc[d, 'Global_Bull_Prob']
+    is_bear = prob < (1.0 - prob_thresh)
+    regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
+    assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
+    
+    table_data.append({
+        "日期": d.strftime('%Y-%m-%d'),
+        "牛市預測機率": f"{prob:.4f}",
+        "市場判定狀態": regime_str,
+        "配置資產池": ", ".join(assets)
+    })
 
-with st.expander("📌 1. 真實數據資產清單與代理代碼", expanded=True):
-    st.markdown("""
-    系統回測時從 Yahoo Finance 抓取的真實市場標的與代碼對應：
-    - **S&P500** (`^GSPC`)：全域基準與大型股大盤代理
-    - **Nasdaq** (`^IXIC`)：科技成長股代理
-    - **Treasury** (`TLT`)：美國 20 年期以上公債（防禦核心）
-    - **Corporate** (`LQD`)：投資級公司債
-    - **HighYield** (`HYG`)：高收益債
-    - **Gold** (`GC=F`)：黃金期貨
-    - **Commodity** (`DBC`)：大宗商品指數
-    - **REIT** (`VNQ`)：不動產信託
-    - **RiskFree**：固定無風險利率代理
-    """)
-
-with st.expander("🛠️ 2. 模型核心運作機制", expanded=False):
-    st.markdown("""
-    - **Statistical Jump Model (SJM)**：動態捕捉真實市場從多頭轉為空頭的結構性跳躍點。
-    - **機器學習分類器**：預測未來市場狀態機率，並動態將資產分配至 **BMDA（防禦資產池）** 或 **BMGA（成長資產池）**。
-    """)
+df_table = pd.DataFrame(table_data)
+st.dataframe(df_table, use_container_width=True, height=400)
