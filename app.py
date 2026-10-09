@@ -306,8 +306,8 @@ st.title("📈 雙重狀態動態資產配置系統")
 st.caption("結合 SJM、機器學習、絕對動量濾網與多空預測勝率追蹤。")
 
 st.sidebar.header("📅 回測時間區間設定")
-default_start = pd.to_datetime("2018-01-01")
-default_end = pd.to_datetime("2026-12-31")
+default_start = pd.to_datetime("2020-01-01")
+default_end = pd.to_datetime("2025-12-31")
 
 start_date = st.sidebar.date_input("回測開始日期", default_start)
 end_date = st.sidebar.date_input("回測結束日期", default_end)
@@ -357,50 +357,4 @@ def fetch_real_market_data():
         df_prices = df_raw[['Close']]
 
     inv_tickers_map = {v: k for k, v in tickers_map.items()}
-    inv_macro_map = {v: k for k, v in macro_tickers.items()}
-    df_prices = df_prices.rename(columns={**inv_tickers_map, **inv_macro_map})
-    
-    valid_cols = [c for c in tickers_map.keys() if c in df_prices.columns]
-    returns_df = df_prices[valid_cols].pct_change().dropna(how='all')
-    returns_df['RiskFree'] = 0.0001
-    
-    macro_cols = [c for c in macro_tickers.keys() if c in df_prices.columns]
-    macro_df = df_prices[macro_cols].reindex(returns_df.index).ffill().bfill()
-    macro_df['Yield_Curve'] = 0.5 
-    macro_df['Inflation'] = 2.0
-    
-    return returns_df.dropna(), macro_df.dropna()
-
-with st.spinner("正在同步真實金融市場與總經歷史數據..."):
-    raw_returns_df, raw_macro_df = fetch_real_market_data()
-
-start_ts = pd.to_datetime(start_date)
-end_ts = pd.to_datetime(end_date)
-common_index = raw_returns_df.index.intersection(raw_macro_df.index)
-clean_returns = raw_returns_df.loc[common_index]
-clean_macro = raw_macro_df.loc[common_index]
-
-mask = (clean_returns.index >= start_ts) & (clean_returns.index <= end_ts)
-returns_df = clean_returns.loc[mask].copy()
-macro_df = clean_macro.loc[mask].copy()
-
-if returns_df.empty or len(returns_df) < 30:
-    st.error("❌ 選擇的時間區間內真實資料不足，請擴大回測起訖日期！")
-    st.stop()
-
-if run_button or 'results' not in st.session_state:
-    with st.spinner(f"模型運算中 (模式：{defense_option})..."):
-        model_instance = DualRegimeAllocationModel(
-            jump_penalty_global=float(jp_global),
-            jump_penalty_asset=float(jp_asset),
-            prob_threshold=float(prob_thresh),
-            ewm_window=int(ewm_win),
-            rebalance_freq=chosen_freq,
-            momentum_lookback=int(mom_lb),
-            defense_mode=chosen_defense_mode
-        )
-        res_df, bmda_hist, bmga_hist, rebal_dates = model_instance.run_pipeline(
-            returns_df.copy(), macro_df.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
-        )
-        st.session_state['results'] = res_df
-        st.session_state['bmda'] = bmda_
+    inv_macro_map = {v: k for k, v in macro
