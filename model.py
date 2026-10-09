@@ -99,12 +99,8 @@ class DualRegimeAllocationModel:
             return XGBClassifier(n_estimators=100, max_depth=3, random_state=42)
 
     def _safe_fit_predict_proba(self, X_train, y_train, X_all):
-        """
-        防禦型擬合：若 y_train 只有單一類別 (例如全 0 或全 1)，避免 ValueError
-        """
         unique_classes = np.unique(y_train)
         if len(unique_classes) < 2:
-            # 若只有單一類別，直接回傳該類別的機率 1.0 或 0.0
             single_val = float(unique_classes[0])
             return np.full(len(X_all), single_val)
         
@@ -112,7 +108,7 @@ class DualRegimeAllocationModel:
         clf.fit(X_train, y_train)
         return clf.predict_proba(X_all)[:, 1]
 
-    def run_pipeline(self, returns_df, macro_df, global_proxy_col='LargeCap', riskfree_col='RiskFree'):
+    def run_pipeline(self, returns_df, macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
         X_min = extract_minimalist_features(returns_df)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
@@ -148,14 +144,13 @@ class DualRegimeAllocationModel:
         asset_regimes_label_df = pd.DataFrame(asset_regimes_label, index=dates)
 
         # ----------------------------------------------------
-        # Step 2: 分類器狀態預測 (加入單一類別防護)
+        # Step 2: 分類器狀態預測
         # ----------------------------------------------------
         y_global = pd.Series(global_regimes_label, index=dates).shift(-1)
         
         X_train_g = X_comp_vals.iloc[:-1].values
         y_train_g = y_global.iloc[:-1].values.astype(int)
         
-        # 安全預測機率
         prob_global_bull = self._safe_fit_predict_proba(X_train_g, y_train_g, X_comp_vals.values)
         
         pred_global_bear = (prob_global_bull < (1.0 - self.threshold)).astype(int)
