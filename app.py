@@ -16,7 +16,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組 (支援熊市防禦模式切換)
+# 1. 核心模型模組
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -96,7 +96,7 @@ class DualRegimeAllocationModel:
         self.ewm_window = int(ewm_window)
         self.rebal_freq = rebalance_freq
         self.mom_lookback = int(momentum_lookback)
-        self.defense_mode = defense_mode  # 'Strict'（熊市嚴禁股票） 或 'Flexible'（允許動量為正的股票）
+        self.defense_mode = defense_mode
         
     def _create_classifier(self):
         if USE_XGB:
@@ -296,10 +296,10 @@ class DualRegimeAllocationModel:
 # ==========================================
 # 2. Streamlit 介面與前端展示
 # ==========================================
-st.set_page_config(page_title="雙重狀態資產配置系統 (模式對比版)", layout="wide")
+st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統 (熊市防禦模式對比)")
-st.caption("支援自由切換【絕對安全防禦（熊市禁股）】與【動量優勢導向（允許動量股）】進行策略效果對比。")
+st.title("📈 雙重狀態動態資產配置系統")
+st.caption("結合 SJM、機器學習、絕對動量濾網與多空預測勝率追蹤。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -313,7 +313,6 @@ rebal_freq_option = st.sidebar.selectbox("資產調倉頻率", ["每月調整 (M
 freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
 chosen_freq = freq_mapping[rebal_freq_option]
 
-# 這是切換熊市防禦模式的選單
 defense_option = st.sidebar.selectbox(
     "熊市防禦資產池模式", 
     [
@@ -330,7 +329,7 @@ jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, 
 prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
 ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
-run_button = st.sidebar.button("🚀 執行模式對比回測")
+run_button = st.sidebar.button("🚀 執行回測與分析")
 
 @st.cache_data(ttl=86400)
 def fetch_real_market_data():
@@ -409,6 +408,27 @@ bmda_hist = st.session_state['bmda']
 bmga_hist = st.session_state['bmga']
 rebal_dates = st.session_state['rebal_dates']
 
+# ==========================================
+# 3. 顯示網頁頂端：最近一期訊號與建議配置
+# ==========================================
+st.markdown("---")
+st.subheader("🎯 最近一期市場訊號與建議配置")
+
+latest_date = res_df.index[-1]
+latest_prob = res_df.loc[latest_date, 'Global_Bull_Prob']
+is_latest_bear = latest_prob < (1.0 - prob_thresh)
+latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成長 (BMGA)"
+latest_assets = bmda_hist.get(latest_date, []) if is_latest_bear else bmga_hist.get(latest_date, [])
+
+c1, c2, c3 = st.columns(3)
+c1.metric("最新訊號日期 (生效日)", latest_date.strftime('%Y-%m-%d'))
+c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
+c3.metric("建議配置資產池", ", ".join(latest_assets))
+st.markdown("---")
+
+# ==========================================
+# 4. 績效與預測勝率計算
+# ==========================================
 cum_returns = (1 + res_df['Return']).cumprod()
 sharpe = (res_df['Return'].mean() * 252) / (res_df['Return'].std() * np.sqrt(252)) if res_df['Return'].std() > 0 else 0
 max_dd = (cum_returns / cum_returns.cummax() - 1).min()
@@ -421,73 +441,29 @@ benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() *
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
 benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
-st.subheader(f"📊 核心績效指標比較 ({rebal_freq_option})")
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
-col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 100:.2f}%")
-col3.metric("年化報酬率", f"{annual_ret * 100:.2f}%", f"大盤基準: {benchmark_annual_ret * 100:.2f}%")
-col4.metric("平均換手率", f"{avg_turnover * 100:.2f}%")
-
-st.markdown("---")
-
-st.subheader("📈 累積淨值曲線對比")
-comparison_df = pd.DataFrame({
-    f"動態配置策略 ({chosen_defense_mode})": cum_returns,
-    "S&P 500 (買入持有)": benchmark_cum
-})
-fig_wealth = px.line(comparison_df, labels={"value": "累積淨值", "index": "日期", "variable": "策略類型"})
-fig_wealth.update_layout(height=450, template="plotly_dark", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-st.plotly_chart(fig_wealth, use_container_width=True)
-
-st.subheader("🌍 全球市場多空狀態歷史判定圖")
-fig_regime = make_subplots(
-    rows=2, cols=1, 
-    shared_xaxes=True, 
-    vertical_spacing=0.08,
-    row_heights=[0.7, 0.3],
-    subplot_titles=("S&P 500 歷史走勢", "模型預測牛市機率 (Prob Bull)")
-)
-
-sp_prices = (1 + benchmark_returns).cumprod()
-fig_regime.add_trace(
-    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
-    row=1, col=1
-)
-
-bull_probs = res_df['Global_Bull_Prob']
-fig_regime.add_trace(
-    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
-    row=2, col=1
-)
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
-
-fig_regime.update_layout(
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_regime, use_container_width=True)
-
-st.markdown("---")
-
-st.subheader(f"📋 資產配置明細表 ({defense_option})")
-st.caption("以下僅列出符合條件且進行【重新調倉】的歷史資產配置紀錄：")
-
-table_data = []
+# 計算多空預測勝率
+correct_count = 0
+total_count = 0
 for d in res_df.index:
-    if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
-        prob = res_df.loc[d, 'Global_Bull_Prob']
-        is_bear = prob < (1.0 - prob_thresh)
-        regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-        assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
-        
-        table_data.append({
-            "調倉日期": d.strftime('%Y-%m-%d'),
-            "牛市預測機率": f"{prob:.4f}",
-            "市場判定狀態": regime_str,
-            "過濾後配置資產池": ", ".join(assets)
-        })
+    prob = res_df.loc[d, 'Global_Bull_Prob']
+    sp_ret = benchmark_returns.loc[d] if d in benchmark_returns.index else 0
+    
+    is_bull_pred = prob >= 0.5  # 以 0.5 作為多空分界
+    is_market_up = sp_ret > 0
+    is_market_down = sp_ret < 0
+    
+    if is_bull_pred and is_market_up:
+        correct_count += 1
+        total_count += 1
+    elif not is_bull_pred and is_market_down:
+        correct_count += 1
+        total_count += 1
+    elif sp_ret != 0:
+        total_count += 1
 
-df_table = pd.DataFrame(table_data)
-st.dataframe(df_table, use_container_width=True, height=400)
+win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
+
+st.subheader(f"📊 核心績效指標與預測勝率 ({rebal_freq_option})")
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("年化夏普值", f"{sharpe:.2f}", f"大盤基準: {benchmark_sharpe:.2f}")
+col2.metric("最大回撤", f"{max_dd * 100:.2f}%", f"大盤基準: {benchmark_max_dd * 10
