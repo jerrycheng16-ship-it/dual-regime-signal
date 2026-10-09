@@ -500,4 +500,58 @@ fig_regime.add_trace(
 
 bull_probs = res_df['Global_Bull_Prob']
 fig_regime.add_trace(
-    go.Scatter(x=bull_
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+# ==========================================
+# 5. 資產配置明細表：新增 S&P 500 報酬率與勝負驗證
+# ==========================================
+st.subheader(f"📋 調倉紀錄、S&P 500 報酬率與預測驗證明細表 ({rebal_freq_option})")
+st.caption("以下列出調倉日的預測狀態，並對比當期 S&P 500 的實際報酬率以驗證預測正確性（✅ 正確 / ❌ 錯誤）：")
+
+table_data = []
+for d in res_df.index:
+    if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily':
+        prob = res_df.loc[d, 'Global_Bull_Prob']
+        is_bear = prob < (1.0 - prob_thresh)
+        regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
+        assets = bmda_hist.get(d, []) if is_bear else bmga_hist.get(d, [])
+        
+        # 取得當天 S&P 500 報酬率
+        sp_ret = benchmark_returns.loc[d] if d in benchmark_returns.index else 0.0
+        
+        # 判斷預測是否正確
+        is_bull_pred = prob >= 0.5
+        is_up = sp_ret > 0
+        is_down = sp_ret < 0
+        
+        if (is_bull_pred and is_up) or (not is_bull_pred and is_down):
+            eval_result = "✅ 正確"
+        elif sp_ret == 0:
+            eval_result = "➖ 持平"
+        else:
+            eval_result = "❌ 錯誤"
+            
+        table_data.append({
+            "調倉日期": d.strftime('%Y-%m-%d'),
+            "牛市預測機率": f"{prob:.4f}",
+            "市場判定狀態": regime_str,
+            "S&P500 當期報酬率": f"{sp_ret * 100:.2f}%",
+            "預測驗證": eval_result,
+            "過濾後配置資產池": ", ".join(assets)
+        })
+
+df_table = pd.DataFrame(table_data)
+st.dataframe(df_table, use_container_width=True, height=400)
