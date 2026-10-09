@@ -15,7 +15,7 @@ except ImportError:
     USE_XGB = False
 
 # ==========================================
-# 1. 核心模型模組 (原 model.py 內容)
+# 1. 核心模型模組 (Statistical Jump Model & Pipeline)
 # ==========================================
 class StatisticalJumpModel:
     def __init__(self, n_clusters=2, jump_penalty=10.0):
@@ -236,7 +236,7 @@ class DualRegimeAllocationModel:
 
 
 # ==========================================
-# 2. Streamlit 介面與前端展示 (原 app.py 內容)
+# 2. Streamlit 介面與前端展示
 # ==========================================
 st.set_page_config(page_title="雙重狀態資產配置模型", layout="wide")
 
@@ -363,4 +363,76 @@ st.plotly_chart(fig_wealth, use_container_width=True)
 
 # 牛熊市歷史狀態判定圖
 st.subheader("🌍 全球市場多空狀態歷史判定圖 (Regime Shifting)")
-st.caption("上方為 S&P
+st.caption("上方為 S&P 500 走勢，下方為模型預測的每日牛市機率，助您一眼識別歷史多空轉折點。")
+
+fig_regime = make_subplots(
+    rows=2, cols=1, 
+    shared_xaxes=True, 
+    vertical_spacing=0.08,
+    row_heights=[0.7, 0.3],
+    subplot_titles=("S&P 500 歷史走勢", "模型預測牛市機率 (Prob Bull)")
+)
+
+sp_prices = (1 + benchmark_returns).cumprod()
+fig_regime.add_trace(
+    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
+    row=1, col=1
+)
+
+bull_probs = res_df['Global_Bull_Prob']
+fig_regime.add_trace(
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+# 動態資產池展示
+col_a, col_b = st.columns(2)
+with col_a:
+    st.subheader("🛡️ 熊市防禦資產池 (BMDA)")
+    latest_date = list(st.session_state['bmda'].keys())[-1]
+    st.write(f"最新日期 ({latest_date.strftime('%Y-%m-%d')}) 選取資產：")
+    st.success(", ".join(st.session_state['bmda'][latest_date]))
+
+with col_b:
+    st.subheader("🚀 牛市成長資產池 (BMGA)")
+    st.write(f"最新日期 ({latest_date.strftime('%Y-%m-%d')}) 選取資產：")
+    st.info(", ".join(st.session_state['bmga'][latest_date]))
+
+st.markdown("---")
+
+# ==========================================
+# 主畫面下方的詳細系統說明文件 (README)
+# ==========================================
+st.header("📖 系統說明與真實資產清單 (README)")
+st.markdown("歡迎使用 **雙重狀態動態資產配置系統**。以下為本系統的核心架構、參數設定與真實資產清單說明。")
+
+st.info("`#Real-Data` `#Yahoo-Finance` `#Quantitative-Strategy` `#Asset-Allocation` `#Python` `#Streamlit`")
+
+with st.expander("📌 1. 真實數據資產清單與代理代碼", expanded=True):
+    st.markdown("""
+    系統回測時從 Yahoo Finance 抓取的真實市場標的與代碼對應：
+    - **S&P500** (`^GSPC`)：全域基準與大型股大盤代理
+    - **Nasdaq** (`^IXIC`)：科技成長股代理
+    - **Treasury** (`TLT`)：美國 20 年期以上公債（防禦核心）
+    - **Corporate** (`LQD`)：投資級公司債
+    - **HighYield** (`HYG`)：高收益債
+    - **Gold** (`GC=F`)：黃金期貨
+    - **Commodity** (`DBC`)：大宗商品指數
+    - **REIT** (`VNQ`)：不動產信託
+    - **RiskFree**：固定無風險利率代理
+    """)
+
+with st.expander("🛠️ 2. 模型核心運作機制", expanded=False):
+    st.markdown("""
+    - **Statistical Jump Model (SJM)**：動態捕捉真實市場從多頭轉為空頭的結構性跳躍點。
+    - **機器學習分類器**：預測未來市場狀態機率，並動態將資產分配至 **BMDA（防禦資產池）** 或 **BMGA（成長資產池）**。
+    """)
