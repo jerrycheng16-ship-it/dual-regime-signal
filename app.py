@@ -64,12 +64,12 @@ class StatisticalJumpModel:
         return states
 
 
-def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
+def extract_minimalist_features(returns_df, riskfree_col='RiskFree', hl_list=[1, 5, 10, 21]):
     risky_cols = [c for c in returns_df.columns if c != riskfree_col]
     features = {}
     for col in risky_cols:
         r = returns_df[col]
-        for hl in [1, 5, 10, 21]:
+        for hl in hl_list:
             alpha = 1 - np.exp(-np.log(2) / hl)
             mean_r = r.ewm(alpha=alpha).mean()
             downside_r = r.clip(upper=0)
@@ -89,7 +89,7 @@ def extract_minimalist_features(returns_df, riskfree_col='RiskFree'):
 
 
 class DualRegimeAllocationModel:
-    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=63, rebalance_freq='Monthly', momentum_lookback=63, defense_mode='Strict'):
+    def __init__(self, jump_penalty_global=20.0, jump_penalty_asset=20.0, prob_threshold=0.7, ewm_window=12, rebalance_freq='Monthly', momentum_lookback=6, defense_mode='Strict'):
         self.jp_global = float(jump_penalty_global)
         self.jp_asset = float(jump_penalty_asset)
         self.threshold = float(prob_threshold)
@@ -117,8 +117,28 @@ class DualRegimeAllocationModel:
         probs = clf.predict_proba(X_all)
         return probs[:, 1] if probs.shape[1] > 1 else np.full(len(X_all), 0.5)
 
-    def run_pipeline(self, returns_df, macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
-        X_min = extract_minimalist_features(returns_df, riskfree_col=riskfree_col)
+    def run_pipeline(self, raw_returns_df, raw_macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
+        # 1. 根據選擇的頻率進行資料重取樣 (Resample)
+        if self.rebal_freq == 'Monthly':
+            returns_df = (1 + raw_returns_df).resample('ME').prod() - 1
+            macro_df = raw_macro_df.resample('ME').last()
+            hl_list = [1, 3, 6, 12]
+            sma_window = 12
+        elif self.rebal_freq == 'Weekly':
+            returns_df = (1 + raw_returns_df).resample('W-FRI').prod() - 1
+            macro_df = raw_macro_df.resample('W-FRI').last()
+            hl_list = [1, 2, 4, 12]
+            sma_window = 10
+        else: # Daily
+            returns_df = raw_returns_df.copy()
+            macro_df = raw_macro_df.copy()
+            hl_list = [1, 5, 10, 21]
+            sma_window = 50
+
+        returns_df = returns_df.dropna()
+        macro_df = macro_df.reindex(returns_df.index).ffill().bfill()
+
+        X_min = extract_minimalist_features(returns_df, riskfree_col=riskfree_col, hl_list=hl_list)
         X_comp = pd.concat([X_min, macro_df], axis=1).reindex(X_min.index).ffill().bfill()
         
         common_idx = X_comp.index.intersection(returns_df.index)
@@ -136,7 +156,7 @@ class DualRegimeAllocationModel:
         global_states = sjm_global.fit_predict(X_comp[global_min_feat].values)
         
         sp_series = returns_df_aligned.loc[dates, global_proxy_col]
-        sp_sma = sp_series.rolling(window=50, min_periods=1).mean()
+        sp_sma = sp_series.rolling(window=sma_window, min_periods=1).mean()
         trend_label = (sp_series > sp_sma).astype(int).values
         
         ret_g0 = sp_series[global_states == 0].mean()
@@ -156,7 +176,7 @@ class DualRegimeAllocationModel:
             sjm_asset = StatisticalJumpModel(n_clusters=2, jump_penalty=self.jp_asset)
             a_states = sjm_asset.fit_predict(X_comp[a_min_feat].values)
             a_series = returns_df_aligned.loc[dates, a]
-            a_sma = a_series.rolling(window=50, min_periods=1).mean()
+            a_sma = a_series.rolling(window=sma_window, min_periods=1).mean()
             a_trend = (a_series > a_sma).astype(int).values
             
             ret_a0 = a_series[a_states == 0].mean()
@@ -243,18 +263,8 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        df_temp = pd.DataFrame(index=dates)
-        if self.rebal_freq == 'Monthly':
-            df_temp['key'] = df_temp.index.to_period('M')
-            rebal_dates = set(df_temp.groupby('key').apply(lambda x: x.index[-1]))
-        elif self.rebal_freq == 'Weekly':
-            df_temp['weekday'] = df_temp.index.weekday
-            df_temp['year_week'] = df_temp.index.isocalendar().week
-            rebal_dates = set(df_temp[df_temp['weekday'] == 4].index).union(
-                set(df_temp.groupby('year_week').apply(lambda x: x.index[-1]))
-            )
-        else:
-            rebal_dates = set(dates)
+        # 每一期皆為調倉日
+        rebal_dates = set(dates)
 
         portfolio_returns = []
         tc_rate = 0.0010
@@ -264,20 +274,15 @@ class DualRegimeAllocationModel:
             d_today = dates[t]
             d_next = dates[t+1]
             
-            is_rebal_day = (t == 0) or (d_today in rebal_dates)
-            
-            if is_rebal_day:
-                if pred_global_bear[t] == 1:
-                    target_assets = bmda_sets.get(d_today, [riskfree_col])
-                else:
-                    target_assets = bmga_sets.get(d_today, [global_proxy_col])
-                    
-                target_weights = pd.Series(0.0, index=returns_df_aligned.columns)
-                target_weights[target_assets] = 1.0 / len(target_assets)
+            if pred_global_bear[t] == 1:
+                target_assets = bmda_sets.get(d_today, [riskfree_col])
             else:
-                target_weights = prev_weights.copy()
+                target_assets = bmga_sets.get(d_today, [global_proxy_col])
+                
+            target_weights = pd.Series(0.0, index=returns_df_aligned.columns)
+            target_weights[target_assets] = 1.0 / len(target_assets)
             
-            turnover = np.sum(np.abs(target_weights - prev_weights)) if is_rebal_day else 0.0
+            turnover = np.sum(np.abs(target_weights - prev_weights))
             tc = turnover * tc_rate
             
             r_next = returns_df_aligned.loc[d_next]
@@ -288,12 +293,12 @@ class DualRegimeAllocationModel:
                 'Return': port_r, 
                 'Turnover': turnover,
                 'Global_Bull_Prob': prob_global_bull[t],
-                'Is_Rebal': is_rebal_day
+                'Is_Rebal': True
             })
             prev_weights = target_weights.copy()
             
         res_df = pd.DataFrame(portfolio_returns).set_index('Date')
-        return res_df, bmda_sets, bmga_sets, rebal_dates
+        return res_df, bmda_sets, bmga_sets, rebal_dates, returns_df_aligned
 
 
 # ==========================================
@@ -301,8 +306,8 @@ class DualRegimeAllocationModel:
 # ==========================================
 st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統")
-st.caption("結合 SJM、機器學習、絕對動量濾網與多空預測勝率追蹤。")
+st.title("📈 雙重狀態動態資產配置系統（多頻率對齊版）")
+st.caption("結合 SJM、機器學習、絕對動量濾網，支援月、週、日真實週期預測。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -312,7 +317,7 @@ start_date = st.sidebar.date_input("回測開始日期", default_start)
 end_date = st.sidebar.date_input("回測結束日期", default_end)
 
 st.sidebar.header("⚙️ 模型與策略模式設定")
-rebal_freq_option = st.sidebar.selectbox("資產調倉頻率", ["每月調整 (Monthly)", "每週調整 (Weekly)", "每日調整 (Daily)"], index=0)
+rebal_freq_option = st.sidebar.selectbox("資產調倉與預測頻率", ["每月調整 (Monthly)", "每週調整 (Weekly)", "每日調整 (Daily)"], index=0)
 freq_mapping = {"每月調整 (Monthly)": "Monthly", "每週調整 (Weekly)": "Weekly", "每日調整 (Daily)": "Daily"}
 chosen_freq = freq_mapping[rebal_freq_option]
 
@@ -326,11 +331,25 @@ defense_option = st.sidebar.selectbox(
 )
 chosen_defense_mode = 'Strict' if "Strict" in defense_option else 'Flexible'
 
-mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
-jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
-jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
-prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
-ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
+# 根據頻率動態調整滑桿預設值與範圍
+if chosen_freq == "Monthly":
+    mom_lb = st.sidebar.slider("絕對動量回看期 (月)", 1, 24, 6, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (月)", 1, 24, 6, step=1)
+elif chosen_freq == "Weekly":
+    mom_lb = st.sidebar.slider("絕對動量回看期 (週)", 2, 52, 12, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (週)", 2, 26, 12, step=1)
+else:
+    mom_lb = st.sidebar.slider("絕對動量回看天數 (Momentum Lookback)", 21, 126, 63, step=1)
+    jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
+    jp_asset = st.sidebar.slider("資產 Jump Penalty (λ_asset)", 1.0, 50.0, 15.0, step=1.0)
+    prob_thresh = st.sidebar.slider("分類機率門檻", 0.5, 0.9, 0.7, step=0.05)
+    ewm_win = st.sidebar.slider("EWM 機率平滑視窗 (天)", 10, 126, 63, step=1)
 
 run_button = st.sidebar.button("🚀 執行回測與分析")
 
@@ -380,15 +399,15 @@ clean_returns = raw_returns_df.loc[common_index]
 clean_macro = raw_macro_df.loc[common_index]
 
 mask = (clean_returns.index >= start_ts) & (clean_returns.index <= end_ts)
-returns_df = clean_returns.loc[mask].copy()
-macro_df = clean_macro.loc[mask].copy()
+returns_df_input = clean_returns.loc[mask].copy()
+macro_df_input = clean_macro.loc[mask].copy()
 
-if returns_df.empty or len(returns_df) < 30:
+if returns_df_input.empty or len(returns_df_input) < 30:
     st.error("❌ 選擇的時間區間內真實資料不足，請擴大回測起訖日期！")
     st.stop()
 
 if run_button or 'results' not in st.session_state:
-    with st.spinner(f"模型運算中 (模式：{defense_option})..."):
+    with st.spinner(f"模型運算中 (模式：{defense_option} | 頻率：{rebal_freq_option})..."):
         model_instance = DualRegimeAllocationModel(
             jump_penalty_global=float(jp_global),
             jump_penalty_asset=float(jp_asset),
@@ -398,25 +417,27 @@ if run_button or 'results' not in st.session_state:
             momentum_lookback=int(mom_lb),
             defense_mode=chosen_defense_mode
         )
-        res_df, bmda_hist, bmga_hist, rebal_dates = model_instance.run_pipeline(
-            returns_df.copy(), macro_df.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
+        res_df, bmda_hist, bmga_hist, rebal_dates, returns_aligned = model_instance.run_pipeline(
+            returns_df_input.copy(), macro_df_input.copy(), global_proxy_col='S&P500', riskfree_col='RiskFree'
         )
         st.session_state['results'] = res_df
         st.session_state['bmda'] = bmda_hist
         st.session_state['bmga'] = bmga_hist
         st.session_state['rebal_dates'] = rebal_dates
+        st.session_state['returns_aligned'] = returns_aligned
 
 res_df = st.session_state['results']
 bmda_hist = st.session_state['bmda']
 bmga_hist = st.session_state['bmga']
 rebal_dates = st.session_state['rebal_dates']
-raw_sp_prices = (1 + returns_df['S&P500']).cumprod()
+returns_aligned = st.session_state['returns_aligned']
+raw_sp_prices = (1 + returns_aligned['S&P500']).cumprod()
 
 # ==========================================
-# 3. 顯示網頁頂端：最近一個完整週期的訊號與建議配置
+# 3. 顯示網頁頂端：最近一個週期的訊號與建議配置
 # ==========================================
 st.markdown("---")
-period_name = "最近一週 (每週五結算)" if chosen_freq == "Weekly" else ("最近一月 (每月月底結算)" if chosen_freq == "Monthly" else "最近一日")
+period_name = "最近一月" if chosen_freq == "Monthly" else ("最近一週" if chosen_freq == "Weekly" else "最近一日")
 st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
 
 sorted_rebal_dates = sorted(list(rebal_dates))
@@ -428,7 +449,7 @@ latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成
 latest_assets = bmda_hist.get(latest_rebal_date, []) if is_latest_bear else bmga_hist.get(latest_rebal_date, [])
 
 c1, c2, c3 = st.columns(3)
-c1.metric("當前週期訊號生成日 (調倉日)", latest_rebal_date.strftime('%Y-%m-%d'))
+c1.metric("當前週期訊號生成日", latest_rebal_date.strftime('%Y-%m-%d'))
 c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
 c3.metric("建議配置資產池", ", ".join(latest_assets))
 st.markdown("---")
@@ -437,44 +458,30 @@ st.markdown("---")
 # 4. 績效與預測勝率計算
 # ==========================================
 cum_returns = (1 + res_df['Return']).cumprod()
-sharpe = (res_df['Return'].mean() * 252) / (res_df['Return'].std() * np.sqrt(252)) if res_df['Return'].std() > 0 else 0
+annual_factor = 12 if chosen_freq == "Monthly" else (52 if chosen_freq == "Weekly" else 252)
+sharpe = (res_df['Return'].mean() * annual_factor) / (res_df['Return'].std() * np.sqrt(annual_factor)) if res_df['Return'].std() > 0 else 0
 max_dd = (cum_returns / cum_returns.cummax() - 1).min()
-annual_ret = (cum_returns.iloc[-1] ** (252 / len(res_df))) - 1 if len(res_df) > 0 else 0
+annual_ret = (cum_returns.iloc[-1] ** (annual_factor / len(res_df))) - 1 if len(res_df) > 0 else 0
 avg_turnover = res_df['Turnover'].mean()
 
-benchmark_returns = returns_df.loc[res_df.index, 'S&P500']
+benchmark_returns = returns_aligned.loc[res_df.index, 'S&P500']
 benchmark_cum = (1 + benchmark_returns).cumprod()
-benchmark_sharpe = (benchmark_returns.mean() * 252) / (benchmark_returns.std() * np.sqrt(252)) if benchmark_returns.std() > 0 else 0
+benchmark_sharpe = (benchmark_returns.mean() * annual_factor) / (benchmark_returns.std() * np.sqrt(annual_factor)) if benchmark_returns.std() > 0 else 0
 benchmark_max_dd = (benchmark_cum / benchmark_cum.cummax() - 1).min()
-benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (252 / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
-
-rebal_list = sorted([d for d in res_df.index if res_df.loc[d, 'Is_Rebal'] or chosen_freq == 'Daily'])
+benchmark_annual_ret = (benchmark_cum.iloc[-1] ** (annual_factor / len(benchmark_cum))) - 1 if len(benchmark_cum) > 0 else 0
 
 correct_count = 0
 total_count = 0
 period_records = []
 
+rebal_list = sorted(list(res_df.index))
 for i in range(len(rebal_list)):
     d_start = rebal_list[i]
-    d_end = rebal_list[i+1] if i < len(rebal_list) - 1 else res_df.index[-1]
+    d_end = d_start # 在對齊週期中，報酬率即為當期結算表現
     
-    if d_start not in returns_df.index:
-        continue
-        
-    prob = res_df.loc[d_start, 'Global_Bull_Prob'] if d_start in res_df.index else res_df.iloc[0]['Global_Bull_Prob']
+    prob = res_df.loc[d_start, 'Global_Bull_Prob'] if d_start in res_df.index else 0.5
+    period_sp_ret = benchmark_returns.loc[d_start] if d_start in benchmark_returns.index else 0.0
     
-    start_loc = returns_df.index.get_loc(d_start)
-    holding_start_idx = start_loc + 1 if start_loc + 1 < len(returns_df.index) else start_loc
-    d_holding_start = returns_df.index[holding_start_idx]
-    
-    sp_slice = raw_sp_prices.loc[d_holding_start:d_end]
-    if len(sp_slice) > 1:
-        period_sp_ret = (sp_slice.iloc[-1] / sp_slice.iloc[0]) - 1.0
-    elif len(sp_slice) == 1:
-        period_sp_ret = returns_df.loc[d_holding_start, 'S&P500'] if d_holding_start in returns_df.index else 0.0
-    else:
-        period_sp_ret = 0.0
-        
     is_bull_pred = prob >= 0.5
     is_up = period_sp_ret > 0
     is_down = period_sp_ret < 0
@@ -494,11 +501,10 @@ for i in range(len(rebal_list)):
     assets = bmda_hist.get(d_start, []) if is_bear else bmga_hist.get(d_start, [])
     
     period_records.append({
-        "調倉日期 (收盤)": d_start.strftime('%Y-%m-%d'),
-        "持有區間": f"{d_holding_start.strftime('%Y-%m-%d')} ~ {d_end.strftime('%Y-%m-%d')}",
+        "結算日期": d_start.strftime('%Y-%m-%d'),
         "牛市預測機率": f"{prob:.4f}",
         "市場判定狀態": regime_str,
-        "S&P500 區間報酬率": f"{period_sp_ret * 100:.2f}%",
+        "S&P500 當期報酬率": f"{period_sp_ret * 100:.2f}%",
         "預測驗證": eval_result,
         "過濾後配置資產池": ", ".join(assets)
     })
@@ -533,31 +539,7 @@ fig_regime = make_subplots(
     subplot_titles=("S&P 500 走勢", "模型預測牛市機率 (Prob Bull)")
 )
 
-sp_prices = (1 + benchmark_returns).cumprod()
+sp_prices_plot = (1 + benchmark_returns).cumprod()
 fig_regime.add_trace(
-    go.Scatter(x=sp_prices.index, y=sp_prices, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
-    row=1, col=1
-)
-
-bull_probs = res_df['Global_Bull_Prob']
-fig_regime.add_trace(
-    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
-    row=2, col=1
-)
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
-
-fig_regime.update_layout(
-    template="plotly_dark",
-    height=550,
-    hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-st.plotly_chart(fig_regime, use_container_width=True)
-
-st.markdown("---")
-
-st.subheader(f"📋 調倉週期、持有區間與預測驗證明細表 ({rebal_freq_option})")
-st.caption("明細表中已將持有區間調整為【調倉日隔天起算至下個調倉日】（例如 9/25 週五收盤調倉，持有區間為 9/28 ~ 10/2），供您精準驗證每週表現：")
-
-df_table = pd.DataFrame(period_records)
-st.dataframe(df_table, use_container_width=True, height=400)
+    go.Scatter(x=sp_prices_plot.index, y=sp_prices_plot, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
+    row=1
