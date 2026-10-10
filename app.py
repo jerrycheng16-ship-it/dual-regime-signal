@@ -436,12 +436,11 @@ st.markdown("---")
 period_name = "最近一月" if chosen_freq == "Monthly" else ("最近一週" if chosen_freq == "Weekly" else "最近一日")
 st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
 
-# 找出最後一個有訊號的日期
 dates_index = sorted(list(returns_aligned.index))
 latest_signal_date = dates_index[-2] if len(dates_index) >= 2 else dates_index[-1]
 
 latest_prob = res_df['Global_Bull_Prob'].iloc[-1] if not res_df.empty else 0.5
-is_latest_bear = latest_prob < (1.0 - prob_thresh)
+is_latest_bear = latest_prob < 0.5  # 統一以 0.5 分界
 latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成長 (BMGA)"
 latest_assets = bmda_hist.get(latest_signal_date, []) if is_latest_bear else bmga_hist.get(latest_signal_date, [])
 
@@ -471,11 +470,10 @@ correct_count = 0
 total_count = 0
 period_records = []
 
-# res_df 的 index 是 d_next (未來驗證期)，而對應的預測訊號在 dates 序列中往前推一期
 dates_list = sorted(list(returns_aligned.index))
 for i in range(len(dates_list) - 1):
     d_signal = dates_list[i]     # 結算日 / 訊號生成日
-    d_next = dates_list[i+1]     # 驗證報酬率的未來期 (下一月/下一週/隔天)
+    d_next = dates_list[i+1]     # 驗證報酬率的未來期
     
     if d_next not in res_df.index:
         continue
@@ -497,7 +495,8 @@ for i in range(len(dates_list) - 1):
         eval_result = "❌ 錯誤"
         total_count += 1
         
-    is_bear = prob < (1.0 - prob_thresh)
+    # 狀態顯示與判定邏輯完全同步（以 0.5 為多空界線）
+    is_bear = prob < 0.5
     regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
     assets = bmda_hist.get(d_signal, []) if is_bear else bmga_hist.get(d_signal, [])
     
@@ -552,7 +551,7 @@ fig_regime.add_trace(
     go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
     row=2, col=1
 )
-fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
+fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="多空分界線 (0.5)")
 
 fig_regime.update_layout(
     template="plotly_dark",
