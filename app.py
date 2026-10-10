@@ -365,7 +365,7 @@ def fetch_real_market_data():
     macro_tickers = {'VIX': '^VIX'}
     all_tickers = list(tickers_map.values()) + list(macro_tickers.values())
     
-    df_raw = yf.download(all_tickers, start="2018-01-01", progress=False)
+    df_raw = yf.download(all_tickers, start="2006-01-01", progress=False)
     if isinstance(df_raw.columns, pd.MultiIndex):
         df_prices = df_raw['Adj Close'] if 'Adj Close' in df_raw.columns else df_raw['Close']
     else:
