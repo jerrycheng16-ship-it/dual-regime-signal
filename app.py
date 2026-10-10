@@ -308,8 +308,8 @@ st.title("📈 雙重狀態動態資產配置系統（完整訊號顯示版）")
 st.caption("結合 SJM、機器學習、絕對動量濾網，明細表已完整包含最新收盤訊號。")
 
 st.sidebar.header("📅 回測時間區間設定")
-default_start = pd.to_datetime("2020-01-01")
-default_end = pd.to_datetime("2025-12-31")
+default_start = pd.to_datetime("2i10-01-01")
+default_end = pd.to_datetime("2026-12-31")
 
 start_date = st.sidebar.date_input("回測開始日期", default_start)
 end_date = st.sidebar.date_input("回測結束日期", default_end)
