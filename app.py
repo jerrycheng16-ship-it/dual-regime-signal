@@ -118,7 +118,6 @@ class DualRegimeAllocationModel:
         return probs[:, 1] if probs.shape[1] > 1 else np.full(len(X_all), 0.5)
 
     def run_pipeline(self, raw_returns_df, raw_macro_df, global_proxy_col='S&P500', riskfree_col='RiskFree'):
-        # 1. 根據選擇的頻率進行資料重取樣 (Resample)
         if self.rebal_freq == 'Monthly':
             returns_df = (1 + raw_returns_df).resample('ME').prod() - 1
             macro_df = raw_macro_df.resample('ME').last()
@@ -129,7 +128,7 @@ class DualRegimeAllocationModel:
             macro_df = raw_macro_df.resample('W-FRI').last()
             hl_list = [1, 2, 4, 12]
             sma_window = 10
-        else: # Daily
+        else:
             returns_df = raw_returns_df.copy()
             macro_df = raw_macro_df.copy()
             hl_list = [1, 5, 10, 21]
@@ -263,7 +262,6 @@ class DualRegimeAllocationModel:
             else:
                 bmga_sets[d] = [global_proxy_col]
 
-        # 每一期皆為調倉日
         rebal_dates = set(dates)
 
         portfolio_returns = []
@@ -306,8 +304,8 @@ class DualRegimeAllocationModel:
 # ==========================================
 st.set_page_config(page_title="雙重狀態資產配置系統", layout="wide")
 
-st.title("📈 雙重狀態動態資產配置系統（多頻率對齊版）")
-st.caption("結合 SJM、機器學習、絕對動量濾網，支援月、週、日真實週期預測。")
+st.title("📈 雙重狀態動態資產配置系統（未來報酬驗證版）")
+st.caption("結合 SJM、機器學習、絕對動量濾網，明細表已精確對齊為【預測日對應下期未來報酬】。")
 
 st.sidebar.header("📅 回測時間區間設定")
 default_start = pd.to_datetime("2020-01-01")
@@ -331,7 +329,6 @@ defense_option = st.sidebar.selectbox(
 )
 chosen_defense_mode = 'Strict' if "Strict" in defense_option else 'Flexible'
 
-# 根據頻率動態調整滑桿預設值與範圍
 if chosen_freq == "Monthly":
     mom_lb = st.sidebar.slider("絕對動量回看期 (月)", 1, 24, 6, step=1)
     jp_global = st.sidebar.slider("全域 Jump Penalty (λ_global)", 1.0, 50.0, 15.0, step=1.0)
@@ -431,7 +428,6 @@ bmda_hist = st.session_state['bmda']
 bmga_hist = st.session_state['bmga']
 rebal_dates = st.session_state['rebal_dates']
 returns_aligned = st.session_state['returns_aligned']
-raw_sp_prices = (1 + returns_aligned['S&P500']).cumprod()
 
 # ==========================================
 # 3. 顯示網頁頂端：最近一個週期的訊號與建議配置
@@ -440,22 +436,23 @@ st.markdown("---")
 period_name = "最近一月" if chosen_freq == "Monthly" else ("最近一週" if chosen_freq == "Weekly" else "最近一日")
 st.subheader(f"🎯 依據【{rebal_freq_option}】產生的【{period_name}】市場訊號與建議配置")
 
-sorted_rebal_dates = sorted(list(rebal_dates))
-latest_rebal_date = sorted_rebal_dates[-1] if sorted_rebal_dates else res_df.index[-1]
+# 找出最後一個有訊號的日期
+dates_index = sorted(list(returns_aligned.index))
+latest_signal_date = dates_index[-2] if len(dates_index) >= 2 else dates_index[-1]
 
-latest_prob = res_df.loc[res_df.index >= latest_rebal_date, 'Global_Bull_Prob'].iloc[0] if latest_rebal_date in res_df.index else 0.5
+latest_prob = res_df['Global_Bull_Prob'].iloc[-1] if not res_df.empty else 0.5
 is_latest_bear = latest_prob < (1.0 - prob_thresh)
 latest_state = "🐻 熊市防禦 (BMDA)" if is_latest_bear else "🚀 牛市成長 (BMGA)"
-latest_assets = bmda_hist.get(latest_rebal_date, []) if is_latest_bear else bmga_hist.get(latest_rebal_date, [])
+latest_assets = bmda_hist.get(latest_signal_date, []) if is_latest_bear else bmga_hist.get(latest_signal_date, [])
 
 c1, c2, c3 = st.columns(3)
-c1.metric("當前週期訊號生成日", latest_rebal_date.strftime('%Y-%m-%d'))
+c1.metric("訊號生成日 (結算日)", latest_signal_date.strftime('%Y-%m-%d'))
 c2.metric("模型牛市預測機率", f"{latest_prob:.4f}", latest_state)
 c3.metric("建議配置資產池", ", ".join(latest_assets))
 st.markdown("---")
 
 # ==========================================
-# 4. 績效與預測勝率計算
+# 4. 績效與預測勝率計算（嚴格對齊未來報酬）
 # ==========================================
 cum_returns = (1 + res_df['Return']).cumprod()
 annual_factor = 12 if chosen_freq == "Monthly" else (52 if chosen_freq == "Weekly" else 252)
@@ -474,13 +471,17 @@ correct_count = 0
 total_count = 0
 period_records = []
 
-rebal_list = sorted(list(res_df.index))
-for i in range(len(rebal_list)):
-    d_start = rebal_list[i]
-    d_end = d_start # 在對齊週期中，報酬率即為當期結算表現
+# res_df 的 index 是 d_next (未來驗證期)，而對應的預測訊號在 dates 序列中往前推一期
+dates_list = sorted(list(returns_aligned.index))
+for i in range(len(dates_list) - 1):
+    d_signal = dates_list[i]     # 結算日 / 訊號生成日
+    d_next = dates_list[i+1]     # 驗證報酬率的未來期 (下一月/下一週/隔天)
     
-    prob = res_df.loc[d_start, 'Global_Bull_Prob'] if d_start in res_df.index else 0.5
-    period_sp_ret = benchmark_returns.loc[d_start] if d_start in benchmark_returns.index else 0.0
+    if d_next not in res_df.index:
+        continue
+        
+    prob = res_df.loc[d_next, 'Global_Bull_Prob']
+    period_sp_ret = returns_aligned.loc[d_next, 'S&P500']
     
     is_bull_pred = prob >= 0.5
     is_up = period_sp_ret > 0
@@ -498,15 +499,16 @@ for i in range(len(rebal_list)):
         
     is_bear = prob < (1.0 - prob_thresh)
     regime_str = "🐻 熊市防禦 (BMDA)" if is_bear else "🚀 牛市成長 (BMGA)"
-    assets = bmda_hist.get(d_start, []) if is_bear else bmga_hist.get(d_start, [])
+    assets = bmda_hist.get(d_signal, []) if is_bear else bmga_hist.get(d_signal, [])
     
     period_records.append({
-        "結算日期": d_start.strftime('%Y-%m-%d'),
+        "訊號生成日 (結算)": d_signal.strftime('%Y-%m-%d'),
+        "預驗證未來區間": d_next.strftime('%Y-%m-%d'),
         "牛市預測機率": f"{prob:.4f}",
         "市場判定狀態": regime_str,
-        "S&P500 當期報酬率": f"{period_sp_ret * 100:.2f}%",
+        "S&P500 下期報酬率": f"{period_sp_ret * 100:.2f}%",
         "預測驗證": eval_result,
-        "過濾後配置資產池": ", ".join(assets)
+        "當期配置資產池": ", ".join(assets)
     })
 
 win_rate = (correct_count / total_count) * 100 if total_count > 0 else 0
@@ -562,5 +564,6 @@ st.plotly_chart(fig_regime, use_container_width=True)
 
 st.markdown("---")
 
-st.subheader(f"📋 週期結算、預測與驗證明細表 ({rebal_freq_option})")
+st.subheader(f"📋 週期結算、預測與未來報酬驗證明細表 ({rebal_freq_option})")
+st.caption("明細表中已嚴格對齊：【訊號生成日】的預測，是用來檢驗【驗證未來區間（下期）】S&P500 的真實漲跌表現：")
 st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
