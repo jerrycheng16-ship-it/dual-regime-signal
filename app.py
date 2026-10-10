@@ -542,4 +542,25 @@ fig_regime = make_subplots(
 sp_prices_plot = (1 + benchmark_returns).cumprod()
 fig_regime.add_trace(
     go.Scatter(x=sp_prices_plot.index, y=sp_prices_plot, name="S&P 500 走勢", line=dict(color='#1f77b4', width=2)),
-    row=1
+    row=1, col=1
+)
+
+bull_probs = res_df['Global_Bull_Prob']
+fig_regime.add_trace(
+    go.Scatter(x=bull_probs.index, y=bull_probs, name="牛市機率", line=dict(color='#ff7f0e', width=1.5)),
+    row=2, col=1
+)
+fig_regime.add_hline(y=prob_thresh, line_dash="dash", line_color="gray", row=2, col=1, annotation_text="門檻線")
+
+fig_regime.update_layout(
+    template="plotly_dark",
+    height=550,
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
+st.plotly_chart(fig_regime, use_container_width=True)
+
+st.markdown("---")
+
+st.subheader(f"📋 週期結算、預測與驗證明細表 ({rebal_freq_option})")
+st.dataframe(pd.DataFrame(period_records), use_container_width=True, height=400)
